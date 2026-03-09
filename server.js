@@ -5,7 +5,7 @@ const cors = require("cors");
 const { createCode, verifyCode } = require("./codes");
 
 // -------- CONFIG ---------
-const TOKEN = "MTQ4MDIyNTA0NzE4MzM2NDE2Ng.GW1b38.qQ1rFl6N3L1LZasTFCsJ_NaRk5_pQ7Xs_pmckM";
+const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = "1384283719933628416";
 const LOG_CHANNEL = "1480228633355489310";
 const PORT = process.env.PORT || 3000;
