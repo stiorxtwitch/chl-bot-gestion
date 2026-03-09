@@ -7,7 +7,7 @@ const { createCode, verifyCode } = require("./codes");
 // -------- CONFIG ---------
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = "1384283719933628416";
-const LOG_CHANNEL = "1480228633355489310";
+const LOG_CHANNEL = "1473699667010125986";
 const PORT = process.env.PORT || 3000;
 // -------------------------
 
