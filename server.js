@@ -579,6 +579,34 @@ app.post("/api/log_stock", async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
+//  GET /api/check-discord
+//  Vérifie si un pseudo Discord est membre du serveur CHL
+//  Retourne : { found: true } ou { found: false }
+// ══════════════════════════════════════════════
+app.get("/api/check-discord", async (req, res) => {
+  const username = (req.query.username || "").trim();
+  if (!username) return res.json({ found: false });
+
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+
+    // Forcer le fetch complet des membres pour avoir la liste à jour
+    const members = await guild.members.search({ query: username, limit: 10 });
+
+    // Chercher une correspondance exacte sur le nom d'utilisateur (username, pas displayName)
+    const found = members.some(m =>
+      m.user.username.toLowerCase() === username.toLowerCase()
+    );
+
+    res.json({ found });
+  } catch (err) {
+    console.error("check-discord:", err.message);
+    // En cas d'erreur bot, on répond found: false pour ne pas bloquer
+    res.json({ found: false });
+  }
+});
+
+// ══════════════════════════════════════════════
 //  POST /api/candidature — Formulaire HTML → Discord
 // ══════════════════════════════════════════════
 app.post("/api/candidature", async (req, res) => {
