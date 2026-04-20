@@ -742,6 +742,14 @@ app.post("/api/rendezvous", async (req, res) => {
       if (found) patientId = found.user.id;
     } catch (_) {}
 
+    // ── Résoudre le médecin par son ID Discord (fetch direct = évite le cache manquant) ──
+    let doctorMember = null;
+    try {
+      doctorMember = await guild.members.fetch(doctorDiscordId);
+    } catch (_) {
+      console.warn(`⚠️ Médecin introuvable sur le serveur : ${doctorDiscordId}`);
+    }
+
     // ── Nom du salon : rdv-patienttag-doctorname ──
     const safePatient = discord.replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
     const safeDoctor  = doctorName.replace(/[^a-zA-Z0-9_]/g, "").toLowerCase().substring(0, 20);
@@ -767,17 +775,19 @@ app.post("/api/rendezvous", async (req, res) => {
       });
     }
 
-    // Médecin (par son ID Discord direct)
-    perms.push({
-      id: doctorDiscordId,
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.AttachFiles,
-        PermissionFlagsBits.ManageChannels,
-      ],
-    });
+    // Médecin — uniquement si trouvé sur le serveur
+    if (doctorMember) {
+      perms.push({
+        id: doctorDiscordId,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.AttachFiles,
+          PermissionFlagsBits.ManageChannels,
+        ],
+      });
+    }
 
     // Staff roles
     for (const roleId of STAFF_ROLES) {
@@ -807,16 +817,16 @@ app.post("/api/rendezvous", async (req, res) => {
       .setDescription(
         `Une demande de rendez-vous a été créée via le site web.\n\n` +
         (patientId ? `👤 **Patient :** <@${patientId}>` : `👤 **Patient :** ${discord} *(non trouvé sur le serveur)*`) + `\n` +
-        `👨‍⚕️ **Médecin :** <@${doctorDiscordId}> — ${doctorName}`
+        (doctorMember ? `👨‍⚕️ **Médecin :** <@${doctorDiscordId}> — ${doctorName}` : `👨‍⚕️ **Médecin :** ${doctorName} *(non trouvé sur le serveur)*`)
       )
       .addFields(
-        { name: "👤 Prénom du patient", value: prenom,        inline: true },
-        { name: "🎮 Discord",           value: discord,       inline: true },
-        { name: "👨‍⚕️ Médecin",           value: doctorName,    inline: true },
-        { name: "🔬 Spécialité",        value: doctorSpecialty || "—", inline: true },
-        { name: "📅 Date souhaitée",    value: date,          inline: true },
-        { name: "🕐 Heure souhaitée",   value: heure,         inline: true },
-        { name: "💬 Motif de consultation", value: motif,     inline: false },
+        { name: "👤 Prénom du patient",    value: prenom,               inline: true },
+        { name: "🎮 Discord",              value: discord,              inline: true },
+        { name: "👨‍⚕️ Médecin",              value: doctorName,           inline: true },
+        { name: "🔬 Spécialité",           value: doctorSpecialty || "—", inline: true },
+        { name: "📅 Date souhaitée",       value: date,                 inline: true },
+        { name: "🕐 Heure souhaitée",      value: heure,                inline: true },
+        { name: "💬 Motif de consultation", value: motif,               inline: false },
       )
       .setColor(0x004080)
       .setTimestamp()
@@ -834,9 +844,10 @@ app.post("/api/rendezvous", async (req, res) => {
     );
 
     // Mention patient + médecin dans le message
-    const mentionPatient = patientId ? `<@${patientId}>` : `(${discord})`;
+    const mentionPatient = patientId   ? `<@${patientId}>`      : `(${discord})`;
+    const mentionDoctor  = doctorMember ? `<@${doctorDiscordId}>` : `(${doctorName})`;
     await channel.send({
-      content: `📬 Nouveau rendez-vous — ${mentionPatient} avec <@${doctorDiscordId}>`,
+      content: `📬 Nouveau rendez-vous — ${mentionPatient} avec ${mentionDoctor}`,
       embeds: [embed],
       components: [row],
     });
