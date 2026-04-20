@@ -1,4 +1,4 @@
-// server.js - Render.com — CHL Bot v3 (Stock + Tickets + Recrutement)
+// server.js - Render.com — CHL Bot v3 (Stock + Tickets + Recrutement + Rendez-vous)
 const {
   Client, GatewayIntentBits, EmbedBuilder,
   ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder,
@@ -26,7 +26,7 @@ const TICKET_CATEGORIES = {
   recrutement      : process.env.CAT_RECRUTEMENT  || "1481345886910025891",
   question         : process.env.CAT_QUESTION     || "1481345980640006356",
   plainte          : process.env.CAT_PLAINTE      || "1481346050513047556",
-  rendezvous       : process.env.CAT_RENDEZVOUS   || "1481346494543040716",
+  rendezvous       : process.env.CAT_RENDEZVOUS   || "1481346494543040716", // ← Catégorie RDV
   recrutement_form : process.env.CAT_RC_FORM      || "1481346111250628770",
 };
 
@@ -34,9 +34,7 @@ const STAFF_ROLES = (process.env.STAFF_ROLES || "").split(",").filter(Boolean);
 const RH_ROLE     = process.env.RH_ROLE || "1481345263510753432";
 
 // ── Rôles de ping selon le contexte ──
-// Recrutement (formulaire web)   → rôle RH
 const ROLE_RECRUTEMENT = "1481345263510753432";
-// Tickets (plainte, question, rdv, recrutement ticket) → rôle support
 const ROLE_TICKETS     = "1481345187958489139";
 
 // ── Sheets ──
@@ -316,7 +314,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTimestamp()
         .setFooter({ text: "CHL — Utilisez les boutons ci-dessous pour gérer ce ticket" });
 
-      // Tous les tickets du panneau → ping rôle TICKETS (support)
       await channel.send({
         content: `<@${member.user.id}> <@&${ROLE_TICKETS}>`,
         embeds: [embed],
@@ -452,33 +449,28 @@ client.login(TOKEN);
 // ══════════════════════════════════════════════
 const app = express();
 
-// ── CORS explicite — autorise GitHub Pages + tous origines en fallback ──
 const ALLOWED_ORIGINS = [
   "https://stiorxtwitch.github.io",
-  "https://stiorxtwitch.github.io/",  // trailing slash
-  // Ajoutez d'autres origines si besoin
+  "https://stiorxtwitch.github.io/",
 ];
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  // Autoriser l'origine exacte si elle est dans la liste, sinon autoriser tout
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
-    // Fallback : autoriser toutes les origines (utile en dev / Postman)
     res.setHeader("Access-Control-Allow-Origin", "*");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Max-Age", "86400"); // cache preflight 24h
-  // Répondre immédiatement aux requêtes OPTIONS (preflight)
+  res.setHeader("Access-Control-Max-Age", "86400");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
 app.use(express.json());
 
-app.get("/", (req, res) => res.json({ status: "CHL Bot API v3 ✅ — Stock + Tickets + Recrutement" }));
+app.get("/", (req, res) => res.json({ status: "CHL Bot API v3 ✅ — Stock + Tickets + Recrutement + RDV" }));
 
 app.get("/api/stock", async (req, res) => {
   const lieu = req.query.lieu;
@@ -577,13 +569,9 @@ app.post("/api/log_stock", async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════
-//  GET /api/check-discord
-// ══════════════════════════════════════════════
 app.get("/api/check-discord", async (req, res) => {
   const username = (req.query.username || "").trim();
   if (!username) return res.json({ found: false });
-
   try {
     const guild   = await client.guilds.fetch(GUILD_ID);
     const members = await guild.members.search({ query: username, limit: 10 });
@@ -597,19 +585,13 @@ app.get("/api/check-discord", async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════
-//  POST /api/candidature — Formulaire HTML → Discord
-// ══════════════════════════════════════════════
 app.post("/api/candidature", async (req, res) => {
   const data = req.body;
   if (!data || !data.discord) {
     return res.json({ success: false, error: "Données manquantes ou pseudo Discord absent" });
   }
 
-  // Suffixe hôpital dans le nom du salon : "nord" ou "sud" (défaut: nord)
   const hopitalSuffix = (data.hopitalCible === "sud") ? "sud" : "nord";
-
-  // Nom du salon : rc-discordtag-nord / rc-discordtag-sud
   const safeTag  = (data.discord || "inconnu").replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
   const chanName = `rc-${safeTag}-${hopitalSuffix}`.substring(0, 100);
   const catId    = TICKET_CATEGORIES.recrutement_form;
@@ -617,7 +599,6 @@ app.post("/api/candidature", async (req, res) => {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
 
-    // Trouver le membre Discord par son tag
     let memberId = null;
     try {
       const members = await guild.members.search({ query: data.discord.replace(/^\./, ""), limit: 5 });
@@ -628,7 +609,6 @@ app.post("/api/candidature", async (req, res) => {
       if (found) memberId = found.user.id;
     } catch(_) {}
 
-    // Permissions du salon
     const perms = [{ id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }];
     if (memberId) {
       perms.push({
@@ -660,7 +640,6 @@ app.post("/api/candidature", async (req, res) => {
       topic: `Candidature de ${data.discord} — Hôpital ${hopitalSuffix.toUpperCase()}`,
     });
 
-    // ── Embed récapitulatif ──
     const hopitalLabel = hopitalSuffix === "sud" ? "🏥 Hôpital Sud" : "🏥 Hôpital Nord";
 
     const fields = [
@@ -709,7 +688,7 @@ app.post("/api/candidature", async (req, res) => {
         `${memberId ? `\nMembre identifié : <@${memberId}>` : "\n⚠️ Membre Discord non trouvé sur le serveur"}`
       )
       .addFields(fields)
-      .setColor(hopitalSuffix === "sud" ? 0x004080 : 0x005c2e) // bleu pour sud, vert foncé pour nord
+      .setColor(hopitalSuffix === "sud" ? 0x004080 : 0x005c2e)
       .setTimestamp()
       .setFooter({ text: `CHL Recrutement — ${hopitalLabel}` });
 
@@ -724,7 +703,6 @@ app.post("/api/candidature", async (req, res) => {
         .setStyle(ButtonStyle.Danger),
     );
 
-    // Recrutement formulaire → ping rôle RECRUTEMENT
     const mentionUser = memberId ? `<@${memberId}>` : `(${data.discord})`;
     await channel.send({
       content: `📬 Nouvelle candidature de ${mentionUser} <@&${ROLE_RECRUTEMENT}>`,
@@ -735,6 +713,138 @@ app.post("/api/candidature", async (req, res) => {
     res.json({ success: true, channel: channel.id, channelName: channel.name });
   } catch (err) {
     console.error("candidature:", err);
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════
+//  POST /api/rendezvous — Formulaire site → Discord ticket RDV
+// ══════════════════════════════════════════════
+app.post("/api/rendezvous", async (req, res) => {
+  const { discord, prenom, date, heure, motif, doctorId, doctorName, doctorSpecialty, doctorDiscordId } = req.body;
+
+  // Validation basique
+  if (!discord || !prenom || !date || !heure || !motif || !doctorName || !doctorDiscordId) {
+    return res.json({ success: false, error: "Paramètres manquants" });
+  }
+
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+
+    // ── Résoudre le membre qui prend le RDV (patient) ──
+    let patientId = null;
+    try {
+      const members = await guild.members.search({ query: discord.replace(/^\./, ""), limit: 5 });
+      const found   = members.find(m =>
+        m.user.username.toLowerCase() === discord.replace(/^\./, "").toLowerCase() ||
+        m.user.tag.toLowerCase()      === discord.toLowerCase()
+      );
+      if (found) patientId = found.user.id;
+    } catch (_) {}
+
+    // ── Nom du salon : rdv-patienttag-doctorname ──
+    const safePatient = discord.replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
+    const safeDoctor  = doctorName.replace(/[^a-zA-Z0-9_]/g, "").toLowerCase().substring(0, 20);
+    const chanName    = `rdv-${safePatient}-${safeDoctor}`.substring(0, 100);
+
+    const catId = TICKET_CATEGORIES.rendezvous; // "1481346494543040716"
+
+    // ── Permissions : patient + médecin uniquement (+ staff) ──
+    const perms = [
+      { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    ];
+
+    // Patient
+    if (patientId) {
+      perms.push({
+        id: patientId,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.AttachFiles,
+        ],
+      });
+    }
+
+    // Médecin (par son ID Discord direct)
+    perms.push({
+      id: doctorDiscordId,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.ManageChannels,
+      ],
+    });
+
+    // Staff roles
+    for (const roleId of STAFF_ROLES) {
+      perms.push({
+        id: roleId,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageChannels,
+        ],
+      });
+    }
+
+    // ── Créer le salon ──
+    const channel = await guild.channels.create({
+      name: chanName,
+      type: ChannelType.GuildText,
+      parent: catId || undefined,
+      permissionOverwrites: perms,
+      topic: `Rendez-vous — ${discord} avec ${doctorName} le ${date} à ${heure}`,
+    });
+
+    // ── Embed récapitulatif ──
+    const embed = new EmbedBuilder()
+      .setTitle("📅 Demande de Rendez-vous — CHL")
+      .setDescription(
+        `Une demande de rendez-vous a été créée via le site web.\n\n` +
+        (patientId ? `👤 **Patient :** <@${patientId}>` : `👤 **Patient :** ${discord} *(non trouvé sur le serveur)*`) + `\n` +
+        `👨‍⚕️ **Médecin :** <@${doctorDiscordId}> — ${doctorName}`
+      )
+      .addFields(
+        { name: "👤 Prénom du patient", value: prenom,        inline: true },
+        { name: "🎮 Discord",           value: discord,       inline: true },
+        { name: "👨‍⚕️ Médecin",           value: doctorName,    inline: true },
+        { name: "🔬 Spécialité",        value: doctorSpecialty || "—", inline: true },
+        { name: "📅 Date souhaitée",    value: date,          inline: true },
+        { name: "🕐 Heure souhaitée",   value: heure,         inline: true },
+        { name: "💬 Motif de consultation", value: motif,     inline: false },
+      )
+      .setColor(0x004080)
+      .setTimestamp()
+      .setFooter({ text: "CHL — Rendez-vous via site web" });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("ticket_close")
+        .setLabel("🔒 Fermer le ticket")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("ticket_delete")
+        .setLabel("🗑️ Supprimer")
+        .setStyle(ButtonStyle.Danger),
+    );
+
+    // Mention patient + médecin dans le message
+    const mentionPatient = patientId ? `<@${patientId}>` : `(${discord})`;
+    await channel.send({
+      content: `📬 Nouveau rendez-vous — ${mentionPatient} avec <@${doctorDiscordId}>`,
+      embeds: [embed],
+      components: [row],
+    });
+
+    res.json({ success: true, channel: channel.id, channelName: channel.name });
+
+  } catch (err) {
+    console.error("rendezvous:", err);
     res.json({ success: false, error: err.message });
   }
 });
