@@ -14,32 +14,32 @@ const { createCode, verifyCode } = require("./codes");
 //  CONFIG — Toutes vos variables d'environnement
 // ══════════════════════════════════════════════
 const TOKEN       = process.env.DISCORD_TOKEN;
-const CLIENT_ID   = process.env.CLIENT_ID;          // ID de l'application Discord
+const CLIENT_ID   = process.env.CLIENT_ID;
 const GUILD_ID    = process.env.GUILD_ID    || "1384283719933628416";
 const LOG_CHANNEL = process.env.LOG_CHANNEL || "1473699667010125986";
 const SHEET_ID    = process.env.SHEET_ID    || "1jIhIbWQdbqgggYnr6gxtdAaBAlY-przeuNfb9z1UhmI";
 const PORT        = process.env.PORT        || 3000;
 
-// ─── Salon où le bot envoie l'embed "Créer un ticket"
 const TICKET_PANEL_CHANNEL = process.env.TICKET_PANEL_CHANNEL || "METTEZ_LIDE_SALON_ICI";
 
-// ─── Catégories Discord pour chaque type de ticket (IDs)
 const TICKET_CATEGORIES = {
-  recrutement : process.env.CAT_RECRUTEMENT  || "METTEZ_LIDE_CATEGORIE_ICI",
-  question    : process.env.CAT_QUESTION     || "METTEZ_LIDE_CATEGORIE_ICI",
-  plainte     : process.env.CAT_PLAINTE      || "METTEZ_LIDE_CATEGORIE_ICI",
-  rendezvous  : process.env.CAT_RENDEZVOUS   || "METTEZ_LIDE_CATEGORIE_ICI",
-  recrutement_form : process.env.CAT_RC_FORM || "METTEZ_LIDE_CATEGORIE_ICI",
+  recrutement      : process.env.CAT_RECRUTEMENT  || "METTEZ_LIDE_CATEGORIE_ICI",
+  question         : process.env.CAT_QUESTION     || "METTEZ_LIDE_CATEGORIE_ICI",
+  plainte          : process.env.CAT_PLAINTE      || "METTEZ_LIDE_CATEGORIE_ICI",
+  rendezvous       : process.env.CAT_RENDEZVOUS   || "METTEZ_LIDE_CATEGORIE_ICI",
+  recrutement_form : process.env.CAT_RC_FORM      || "METTEZ_LIDE_CATEGORIE_ICI",
 };
 
-// ─── Rôles qui ont accès à tous les tickets (IDs)
 const STAFF_ROLES = (process.env.STAFF_ROLES || "").split(",").filter(Boolean);
-// Ex: STAFF_ROLES=123456789,987654321
+const RH_ROLE     = process.env.RH_ROLE || "METTEZ_LIDE_ROLE_ICI";
 
-// ─── Rôle autorisé à utiliser /attente /valider /refuser
-const RH_ROLE = process.env.RH_ROLE || "METTEZ_LIDE_ROLE_ICI";
+// ── Rôles de ping selon le contexte ──
+// Recrutement (formulaire web)   → rôle RH
+const ROLE_RECRUTEMENT = "1481345263510753432";
+// Tickets (plainte, question, rdv, recrutement ticket) → rôle support
+const ROLE_TICKETS     = "1481345187958489139";
 
-// ─── Sheets
+// ── Sheets ──
 const SHEET_LOGS   = "Sheet1";
 const SHEET_PHARMA = "Sheet2";
 const SHEET_SOIN   = "Sheet3";
@@ -170,13 +170,9 @@ async function registerCommands() {
 // ══════════════════════════════════════════════
 //  HELPERS TICKETS
 // ══════════════════════════════════════════════
-
-// Crée les permissions du salon ticket
 function buildTicketPermissions(guild, userId) {
   const overwrites = [
-    // @everyone — pas accès
     { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-    // Créateur du ticket — accès complet
     {
       id: userId,
       allow: [
@@ -187,7 +183,6 @@ function buildTicketPermissions(guild, userId) {
       ],
     },
   ];
-  // Rôles staff — accès complet
   for (const roleId of STAFF_ROLES) {
     overwrites.push({
       id: roleId,
@@ -203,13 +198,11 @@ function buildTicketPermissions(guild, userId) {
   return overwrites;
 }
 
-// Vérifie si l'utilisateur a un rôle staff ou est admin
 function isStaff(member) {
   if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
   return STAFF_ROLES.some(id => member.roles.cache.has(id));
 }
 
-// Envoie l'embed de panneau ticket
 async function sendTicketPanel(channel) {
   const embed = new EmbedBuilder()
     .setTitle("🏥 Support — Centre Hospitalier de Liège")
@@ -240,7 +233,6 @@ async function sendTicketPanel(channel) {
   await channel.send({ embeds: [embed], components: [row] });
 }
 
-// Boutons fermer/supprimer
 function buildTicketButtons() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -254,7 +246,6 @@ function buildTicketButtons() {
   );
 }
 
-// Noms lisibles pour les types de ticket
 const TICKET_LABELS = {
   recrutement : "Problème Recrutement",
   question    : "Question",
@@ -294,13 +285,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const label  = TICKET_LABELS[type] || type;
     const catId  = TICKET_CATEGORIES[type];
 
-    // Nom du salon : type-discordtag
     const channelName = `${type}-${tag}`.toLowerCase().substring(0, 100);
 
     await interaction.deferReply({ ephemeral: true });
 
     try {
-      // Vérifier si ce membre a déjà un ticket ouvert du même type
       const existing = guild.channels.cache.find(
         c => c.name === channelName && c.parentId === catId
       );
@@ -308,7 +297,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.editReply({ content: `❌ Vous avez déjà un ticket de ce type ouvert : <#${existing.id}>` });
       }
 
-      // Créer le salon
       const channel = await guild.channels.create({
         name: channelName,
         type: ChannelType.GuildText,
@@ -317,7 +305,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         topic: `Ticket ${label} — ${member.user.tag}`,
       });
 
-      // Embed d'ouverture
       const embed = new EmbedBuilder()
         .setTitle(`🎫 ${label}`)
         .setDescription(
@@ -329,8 +316,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTimestamp()
         .setFooter({ text: "CHL — Utilisez les boutons ci-dessous pour gérer ce ticket" });
 
+      // Tous les tickets du panneau → ping rôle TICKETS (support)
       await channel.send({
-        content: `<@${member.user.id}> ${STAFF_ROLES.map(r => `<@&${r}>`).join(" ")}`,
+        content: `<@${member.user.id}> <@&${ROLE_TICKETS}>`,
         embeds: [embed],
         components: [buildTicketButtons()],
       });
@@ -350,7 +338,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "❌ Seul le staff peut fermer les tickets.", ephemeral: true });
     }
     await interaction.reply({ content: "🔒 Ticket fermé. Le salon sera archivé." });
-    // Retirer les permissions de l'utilisateur (sauf staff)
     const channel = interaction.channel;
     for (const [id, overwrite] of channel.permissionOverwrites.cache) {
       const isStaffRole = STAFF_ROLES.includes(id) || id === guild.id;
@@ -358,7 +345,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await channel.permissionOverwrites.edit(id, { SendMessages: false }).catch(() => {});
       }
     }
-    // Renommer avec prefix "fermé"
     await channel.setName("fermé-" + channel.name).catch(() => {});
     return;
   }
@@ -377,7 +363,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   const { commandName, member, channel } = interaction;
 
-  // ─── /ticket_panel ───
   if (commandName === "ticket_panel") {
     if (!member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ content: "❌ Administrateur uniquement.", ephemeral: true });
@@ -386,7 +371,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.reply({ content: "✅ Panneau ticket envoyé.", ephemeral: true });
   }
 
-  // ─── /fermer ───
   if (commandName === "fermer") {
     if (!isStaff(member)) {
       return interaction.reply({ content: "❌ Staff uniquement.", ephemeral: true });
@@ -401,7 +385,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // ─── /supprimer ───
   if (commandName === "supprimer") {
     if (!isStaff(member)) {
       return interaction.reply({ content: "❌ Staff uniquement.", ephemeral: true });
@@ -411,7 +394,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // ─── /attente ───
   if (commandName === "attente") {
     if (!isStaff(member) && !member.roles.cache.has(RH_ROLE)) {
       return interaction.reply({ content: "❌ RH / Staff uniquement.", ephemeral: true });
@@ -428,7 +410,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.reply({ embeds: [embed] });
   }
 
-  // ─── /valider ───
   if (commandName === "valider") {
     if (!isStaff(member) && !member.roles.cache.has(RH_ROLE)) {
       return interaction.reply({ content: "❌ RH / Staff uniquement.", ephemeral: true });
@@ -446,7 +427,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.reply({ embeds: [embed] });
   }
 
-  // ─── /refuser ───
   if (commandName === "refuser") {
     if (!isStaff(member) && !member.roles.cache.has(RH_ROLE)) {
       return interaction.reply({ content: "❌ RH / Staff uniquement.", ephemeral: true });
@@ -476,7 +456,6 @@ app.use(express.json());
 
 app.get("/", (req, res) => res.json({ status: "CHL Bot API v3 ✅ — Stock + Tickets + Recrutement" }));
 
-// ── GET /api/stock ──
 app.get("/api/stock", async (req, res) => {
   const lieu = req.query.lieu;
   if (!lieu) return res.json({ success: false, error: "Paramètre lieu manquant" });
@@ -489,7 +468,6 @@ app.get("/api/stock", async (req, res) => {
   }
 });
 
-// ── GET /api/logs ──
 app.get("/api/logs", async (req, res) => {
   try {
     const sheets = await getSheetsClient();
@@ -507,7 +485,6 @@ app.get("/api/logs", async (req, res) => {
   }
 });
 
-// ── GET /api/send_code ──
 app.get("/api/send_code", async (req, res) => {
   const username = req.query.user;
   if (!username) return res.json({ success: false, error: "Pseudo manquant" });
@@ -524,7 +501,6 @@ app.get("/api/send_code", async (req, res) => {
   }
 });
 
-// ── GET /api/verify ──
 app.get("/api/verify", async (req, res) => {
   const { user, code } = req.query;
   if (!verifyCode(user, code)) return res.json({ success: false, error: "Code invalide ou expiré" });
@@ -544,7 +520,6 @@ app.get("/api/verify", async (req, res) => {
   }
 });
 
-// ── POST /api/log_stock ──
 app.post("/api/log_stock", async (req, res) => {
   const { user, item, delta, location } = req.body;
   if (!user || !item || delta === undefined || !location)
@@ -580,28 +555,20 @@ app.post("/api/log_stock", async (req, res) => {
 
 // ══════════════════════════════════════════════
 //  GET /api/check-discord
-//  Vérifie si un pseudo Discord est membre du serveur CHL
-//  Retourne : { found: true } ou { found: false }
 // ══════════════════════════════════════════════
 app.get("/api/check-discord", async (req, res) => {
   const username = (req.query.username || "").trim();
   if (!username) return res.json({ found: false });
 
   try {
-    const guild = await client.guilds.fetch(GUILD_ID);
-
-    // Forcer le fetch complet des membres pour avoir la liste à jour
+    const guild   = await client.guilds.fetch(GUILD_ID);
     const members = await guild.members.search({ query: username, limit: 10 });
-
-    // Chercher une correspondance exacte sur le nom d'utilisateur (username, pas displayName)
-    const found = members.some(m =>
+    const found   = members.some(m =>
       m.user.username.toLowerCase() === username.toLowerCase()
     );
-
     res.json({ found });
   } catch (err) {
     console.error("check-discord:", err.message);
-    // En cas d'erreur bot, on répond found: false pour ne pas bloquer
     res.json({ found: false });
   }
 });
@@ -615,10 +582,13 @@ app.post("/api/candidature", async (req, res) => {
     return res.json({ success: false, error: "Données manquantes ou pseudo Discord absent" });
   }
 
-  // Nom du salon : rc-discordtag (sans caractères spéciaux)
-  const safeTag   = (data.discord || "inconnu").replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
-  const chanName  = `rc-${safeTag}`.substring(0, 100);
-  const catId     = TICKET_CATEGORIES.recrutement_form;
+  // Suffixe hôpital dans le nom du salon : "nord" ou "sud" (défaut: nord)
+  const hopitalSuffix = (data.hopitalCible === "sud") ? "sud" : "nord";
+
+  // Nom du salon : rc-discordtag-nord / rc-discordtag-sud
+  const safeTag  = (data.discord || "inconnu").replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
+  const chanName = `rc-${safeTag}-${hopitalSuffix}`.substring(0, 100);
+  const catId    = TICKET_CATEGORIES.recrutement_form;
 
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
@@ -634,7 +604,7 @@ app.post("/api/candidature", async (req, res) => {
       if (found) memberId = found.user.id;
     } catch(_) {}
 
-    // Créer le salon
+    // Permissions du salon
     const perms = [{ id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }];
     if (memberId) {
       perms.push({
@@ -663,17 +633,20 @@ app.post("/api/candidature", async (req, res) => {
       type: ChannelType.GuildText,
       parent: catId || undefined,
       permissionOverwrites: perms,
-      topic: `Candidature de ${data.discord}`,
+      topic: `Candidature de ${data.discord} — Hôpital ${hopitalSuffix.toUpperCase()}`,
     });
 
-    // ── Construire l'embed récapitulatif ──
+    // ── Embed récapitulatif ──
+    const hopitalLabel = hopitalSuffix === "sud" ? "🏥 Hôpital Sud" : "🏥 Hôpital Nord";
+
     const fields = [
-      { name: "🎮 Discord",      value: data.discord      || "—", inline: true },
-      { name: "📱 Téléphone",    value: data.telephone    || "—", inline: true },
-      { name: "👤 Nom",          value: data.nom          || "—", inline: true },
-      { name: "👤 Prénom",       value: data.prenom       || "—", inline: true },
-      { name: "🎂 Âge",          value: data.age          || "—", inline: true },
-      { name: "⚖️ Casier jud.",  value: data.casier       || "—", inline: true },
+      { name: "🎮 Discord",       value: data.discord      || "—", inline: true },
+      { name: "📱 Téléphone",     value: data.telephone    || "—", inline: true },
+      { name: "🏥 Hôpital visé", value: hopitalLabel,              inline: true },
+      { name: "👤 Nom",           value: data.nom          || "—", inline: true },
+      { name: "👤 Prénom",        value: data.prenom       || "—", inline: true },
+      { name: "🎂 Âge",           value: data.age          || "—", inline: true },
+      { name: "⚖️ Casier jud.",   value: data.casier       || "—", inline: true },
     ];
 
     if (data.experiencePasse === "oui") {
@@ -699,24 +672,23 @@ app.post("/api/candidature", async (req, res) => {
     }
 
     fields.push(
-      { name: "💬 Motivation",     value: data.motivation   || "—", inline: false },
-      { name: "✨ Citation fav.",  value: data.citation     || "—", inline: true },
-      { name: "🏷️ Mot qui me représente", value: data.mot  || "—", inline: true },
-      { name: "📚 Formation acceptée",    value: data.formation || "—", inline: true },
+      { name: "💬 Motivation",            value: data.motivation || "—", inline: false },
+      { name: "✨ Citation fav.",         value: data.citation   || "—", inline: true },
+      { name: "🏷️ Mot qui me représente", value: data.mot        || "—", inline: true },
+      { name: "📚 Formation acceptée",    value: data.formation  || "—", inline: true },
     );
 
     const embed = new EmbedBuilder()
-      .setTitle(`📋 Candidature — ${data.discord}`)
+      .setTitle(`📋 Candidature — ${data.discord} [${hopitalSuffix.toUpperCase()}]`)
       .setDescription(
         `Nouvelle candidature reçue via le formulaire web.\n` +
         `${memberId ? `\nMembre identifié : <@${memberId}>` : "\n⚠️ Membre Discord non trouvé sur le serveur"}`
       )
       .addFields(fields)
-      .setColor(0x004080)
+      .setColor(hopitalSuffix === "sud" ? 0x004080 : 0x005c2e) // bleu pour sud, vert foncé pour nord
       .setTimestamp()
-      .setFooter({ text: "CHL Recrutement — Formulaire web" });
+      .setFooter({ text: `CHL Recrutement — ${hopitalLabel}` });
 
-    // Boutons de gestion
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId("ticket_close")
@@ -728,10 +700,10 @@ app.post("/api/candidature", async (req, res) => {
         .setStyle(ButtonStyle.Danger),
     );
 
-    const mentionStaff = STAFF_ROLES.map(r => `<@&${r}>`).join(" ");
-    const mentionUser  = memberId ? `<@${memberId}>` : `(${data.discord})`;
+    // Recrutement formulaire → ping rôle RECRUTEMENT
+    const mentionUser = memberId ? `<@${memberId}>` : `(${data.discord})`;
     await channel.send({
-      content: `📬 Nouvelle candidature de ${mentionUser} ${mentionStaff}`,
+      content: `📬 Nouvelle candidature de ${mentionUser} <@&${ROLE_RECRUTEMENT}>`,
       embeds: [embed],
       components: [row],
     });
