@@ -31,7 +31,7 @@ const TICKET_CATEGORIES = {
 };
 
 const STAFF_ROLES = (process.env.STAFF_ROLES || "").split(",").filter(Boolean);
-const RH_ROLE     = process.env.RH_ROLE || "1495678564333256794";
+const RH_ROLE     = process.env.RH_ROLE || "1481345263510753432";
 
 // ── Rôles de ping selon le contexte ──
 // Recrutement (formulaire web)   → rôle RH
@@ -451,7 +451,31 @@ client.login(TOKEN);
 //  EXPRESS API
 // ══════════════════════════════════════════════
 const app = express();
-app.use(cors());
+
+// ── CORS explicite — autorise GitHub Pages + tous origines en fallback ──
+const ALLOWED_ORIGINS = [
+  "https://stiorxtwitch.github.io",
+  "https://stiorxtwitch.github.io/",  // trailing slash
+  // Ajoutez d'autres origines si besoin
+];
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  // Autoriser l'origine exacte si elle est dans la liste, sinon autoriser tout
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    // Fallback : autoriser toutes les origines (utile en dev / Postman)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400"); // cache preflight 24h
+  // Répondre immédiatement aux requêtes OPTIONS (preflight)
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json());
 
 app.get("/", (req, res) => res.json({ status: "CHL Bot API v3 ✅ — Stock + Tickets + Recrutement" }));
