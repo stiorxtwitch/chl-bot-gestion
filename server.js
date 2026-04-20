@@ -20,18 +20,18 @@ const LOG_CHANNEL = process.env.LOG_CHANNEL || "1473699667010125986";
 const SHEET_ID    = process.env.SHEET_ID    || "1jIhIbWQdbqgggYnr6gxtdAaBAlY-przeuNfb9z1UhmI";
 const PORT        = process.env.PORT        || 3000;
 
-const TICKET_PANEL_CHANNEL = process.env.TICKET_PANEL_CHANNEL || "METTEZ_LIDE_SALON_ICI";
+const TICKET_PANEL_CHANNEL = process.env.TICKET_PANEL_CHANNEL || "1473699660328734926";
 
 const TICKET_CATEGORIES = {
-  recrutement      : process.env.CAT_RECRUTEMENT  || "METTEZ_LIDE_CATEGORIE_ICI",
-  question         : process.env.CAT_QUESTION     || "METTEZ_LIDE_CATEGORIE_ICI",
-  plainte          : process.env.CAT_PLAINTE      || "METTEZ_LIDE_CATEGORIE_ICI",
-  rendezvous       : process.env.CAT_RENDEZVOUS   || "METTEZ_LIDE_CATEGORIE_ICI",
-  recrutement_form : process.env.CAT_RC_FORM      || "METTEZ_LIDE_CATEGORIE_ICI",
+  recrutement      : process.env.CAT_RECRUTEMENT  || "1481345886910025891",
+  question         : process.env.CAT_QUESTION     || "1481345980640006356",
+  plainte          : process.env.CAT_PLAINTE      || "1481346050513047556",
+  rendezvous       : process.env.CAT_RENDEZVOUS   || "1481346494543040716",
+  recrutement_form : process.env.CAT_RC_FORM      || "1481346111250628770",
 };
 
 const STAFF_ROLES = (process.env.STAFF_ROLES || "").split(",").filter(Boolean);
-const RH_ROLE     = process.env.RH_ROLE || "METTEZ_LIDE_ROLE_ICI";
+const RH_ROLE     = process.env.RH_ROLE || "1495678564333256794";
 
 // ── Rôles de ping selon le contexte ──
 // Recrutement (formulaire web)   → rôle RH
