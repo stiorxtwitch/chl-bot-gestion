@@ -3,7 +3,8 @@ const {
   Client, GatewayIntentBits, EmbedBuilder,
   ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder,
   ButtonStyle, ChannelType, PermissionFlagsBits, Events,
-  InteractionType, SlashCommandBuilder, REST, Routes
+  InteractionType, SlashCommandBuilder, REST, Routes,
+  AttachmentBuilder
 } = require("discord.js");
 const express = require("express");
 const cors    = require("cors");
@@ -20,13 +21,14 @@ const LOG_CHANNEL = process.env.LOG_CHANNEL || "1473699667010125986";
 const SHEET_ID    = process.env.SHEET_ID    || "1jIhIbWQdbqgggYnr6gxtdAaBAlY-przeuNfb9z1UhmI";
 const PORT        = process.env.PORT        || 3000;
 
-const TICKET_PANEL_CHANNEL = process.env.TICKET_PANEL_CHANNEL || "1473699660328734926";
+const TICKET_PANEL_CHANNEL  = process.env.TICKET_PANEL_CHANNEL  || "1473699660328734926";
+const TRANSCRIPT_CHANNEL_ID = process.env.TRANSCRIPT_CHANNEL_ID || "1498338598917902507";
 
 const TICKET_CATEGORIES = {
   recrutement      : process.env.CAT_RECRUTEMENT  || "1481345886910025891",
   question         : process.env.CAT_QUESTION     || "1481345980640006356",
   plainte          : process.env.CAT_PLAINTE      || "1481346050513047556",
-  rendezvous       : process.env.CAT_RENDEZVOUS   || "1481346494543040716", // ← Catégorie RDV
+  rendezvous       : process.env.CAT_RENDEZVOUS   || "1481346494543040716",
   recrutement_form : process.env.CAT_RC_FORM      || "1481346111250628770",
 };
 
@@ -127,6 +129,62 @@ async function appendLog(user, item, delta, location, oldQty, newQty) {
 }
 
 // ══════════════════════════════════════════════
+//  HELPER — Génération de transcript
+// ══════════════════════════════════════════════
+async function generateTranscript(channel) {
+  const lines = [];
+  lines.push(`═══════════════════════════════════════════════`);
+  lines.push(`  TRANSCRIPT — #${channel.name}`);
+  lines.push(`  Serveur : ${channel.guild.name}`);
+  lines.push(`  Généré le : ${new Date().toLocaleString("fr-FR")}`);
+  lines.push(`═══════════════════════════════════════════════\n`);
+
+  let lastMessage = null;
+  let allMessages = [];
+
+  // Récupération de tous les messages (max 5000)
+  while (true) {
+    const options = { limit: 100 };
+    if (lastMessage) options.before = lastMessage;
+    const batch = await channel.messages.fetch(options);
+    if (batch.size === 0) break;
+    allMessages = allMessages.concat([...batch.values()]);
+    lastMessage = batch.last().id;
+    if (batch.size < 100) break;
+  }
+
+  // Tri chronologique
+  allMessages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+  for (const msg of allMessages) {
+    const date    = msg.createdAt.toLocaleString("fr-FR");
+    const author  = `${msg.author.tag}`;
+    const content = msg.content || "(aucun contenu texte)";
+
+    lines.push(`[${date}] ${author}`);
+    lines.push(`  ${content}`);
+
+    if (msg.attachments.size > 0) {
+      msg.attachments.forEach(att => {
+        lines.push(`  📎 Pièce jointe : ${att.url}`);
+      });
+    }
+    if (msg.embeds.length > 0) {
+      msg.embeds.forEach(e => {
+        if (e.title) lines.push(`  📋 Embed : ${e.title}`);
+      });
+    }
+    lines.push("");
+  }
+
+  lines.push(`═══════════════════════════════════════════════`);
+  lines.push(`  Fin du transcript — ${allMessages.length} message(s)`);
+  lines.push(`═══════════════════════════════════════════════`);
+
+  return lines.join("\n");
+}
+
+// ══════════════════════════════════════════════
 //  SLASH COMMANDS REGISTRATION
 // ══════════════════════════════════════════════
 const commands = [
@@ -142,6 +200,25 @@ const commands = [
   new SlashCommandBuilder()
     .setName("supprimer")
     .setDescription("Supprime définitivement ce ticket"),
+
+  // ── NOUVELLE COMMANDE /delete ──
+  new SlashCommandBuilder()
+    .setName("delete")
+    .setDescription("Supprime ce ticket avec une raison et un transcript optionnel")
+    .addStringOption(opt =>
+      opt.setName("raison")
+        .setDescription("Raison de la suppression")
+        .setRequired(true)
+    )
+    .addStringOption(opt =>
+      opt.setName("transcript")
+        .setDescription("Générer un transcript du ticket ?")
+        .setRequired(true)
+        .addChoices(
+          { name: "Oui", value: "oui" },
+          { name: "Non", value: "non" }
+        )
+    ),
 
   new SlashCommandBuilder()
     .setName("attente")
@@ -388,6 +465,79 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     await interaction.reply({ content: "🗑️ Suppression dans 5 secondes..." });
     setTimeout(() => channel.delete().catch(() => {}), 5000);
+    return;
+  }
+
+  // ═══════════════════════════════════════════
+  //  /delete <raison> <transcript oui|non>
+  // ═══════════════════════════════════════════
+  if (commandName === "delete") {
+    if (!isStaff(member)) {
+      return interaction.reply({ content: "❌ Staff uniquement.", ephemeral: true });
+    }
+
+    const raison     = interaction.options.getString("raison");
+    const doTranscript = interaction.options.getString("transcript") === "oui";
+
+    await interaction.deferReply();
+
+    try {
+      // ── Embed de confirmation dans le ticket ──
+      const confirmEmbed = new EmbedBuilder()
+        .setTitle("🗑️ Ticket en cours de suppression")
+        .setDescription(
+          `Ce ticket va être supprimé dans **5 secondes**.\n\n` +
+          `**Raison :** ${raison}\n` +
+          `**Transcript :** ${doTranscript ? "✅ Oui — envoyé dans le salon dédié" : "❌ Non"}\n\n` +
+          `**Fermé par :** ${member.user.tag}`
+        )
+        .setColor(0xe74c3c)
+        .setTimestamp()
+        .setFooter({ text: "CHL — Gestion des tickets" });
+
+      await interaction.editReply({ embeds: [confirmEmbed] });
+
+      // ── Génération du transcript si demandé ──
+      if (doTranscript) {
+        try {
+          const transcriptText = await generateTranscript(channel);
+          const fileName       = `transcript-${channel.name}-${Date.now()}.txt`;
+          const attachment     = new AttachmentBuilder(
+            Buffer.from(transcriptText, "utf-8"),
+            { name: fileName }
+          );
+
+          const transcriptChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
+
+          const transcriptEmbed = new EmbedBuilder()
+            .setTitle("📄 Transcript de ticket")
+            .setDescription(
+              `**Salon :** #${channel.name}\n` +
+              `**Raison de fermeture :** ${raison}\n` +
+              `**Fermé par :** ${member.user.tag} (<@${member.user.id}>)\n` +
+              `**Date :** ${new Date().toLocaleString("fr-FR")}`
+            )
+            .setColor(0x004080)
+            .setTimestamp()
+            .setFooter({ text: "CHL — Transcripts" });
+
+          await transcriptChannel.send({
+            embeds: [transcriptEmbed],
+            files: [attachment],
+          });
+
+        } catch (err) {
+          console.error("Erreur transcript /delete :", err.message);
+        }
+      }
+
+      // ── Suppression du salon après 5 secondes ──
+      setTimeout(() => channel.delete().catch(() => {}), 5000);
+
+    } catch (err) {
+      console.error("/delete:", err.message);
+      await interaction.editReply({ content: `❌ Erreur : ${err.message}` });
+    }
     return;
   }
 
@@ -723,7 +873,6 @@ app.post("/api/candidature", async (req, res) => {
 app.post("/api/rendezvous", async (req, res) => {
   const { discord, prenom, date, heure, motif, doctorId, doctorName, doctorSpecialty, doctorDiscordId } = req.body;
 
-  // Validation basique
   if (!discord || !prenom || !date || !heure || !motif || !doctorName || !doctorDiscordId) {
     return res.json({ success: false, error: "Paramètres manquants" });
   }
@@ -731,7 +880,6 @@ app.post("/api/rendezvous", async (req, res) => {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
 
-    // ── Résoudre le membre qui prend le RDV (patient) ──
     let patientId = null;
     try {
       const members = await guild.members.search({ query: discord.replace(/^\./, ""), limit: 5 });
@@ -742,7 +890,6 @@ app.post("/api/rendezvous", async (req, res) => {
       if (found) patientId = found.user.id;
     } catch (_) {}
 
-    // ── Résoudre le médecin par son ID Discord (fetch direct = évite le cache manquant) ──
     let doctorMember = null;
     try {
       doctorMember = await guild.members.fetch(doctorDiscordId);
@@ -750,19 +897,16 @@ app.post("/api/rendezvous", async (req, res) => {
       console.warn(`⚠️ Médecin introuvable sur le serveur : ${doctorDiscordId}`);
     }
 
-    // ── Nom du salon : rdv-patienttag-doctorname ──
     const safePatient = discord.replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
     const safeDoctor  = doctorName.replace(/[^a-zA-Z0-9_]/g, "").toLowerCase().substring(0, 20);
     const chanName    = `rdv-${safePatient}-${safeDoctor}`.substring(0, 100);
 
-    const catId = TICKET_CATEGORIES.rendezvous; // "1481346494543040716"
+    const catId = TICKET_CATEGORIES.rendezvous;
 
-    // ── Permissions : patient + médecin uniquement (+ staff) ──
     const perms = [
       { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
     ];
 
-    // Patient
     if (patientId) {
       perms.push({
         id: patientId,
@@ -775,7 +919,6 @@ app.post("/api/rendezvous", async (req, res) => {
       });
     }
 
-    // Médecin — uniquement si trouvé sur le serveur
     if (doctorMember) {
       perms.push({
         id: doctorDiscordId,
@@ -789,7 +932,6 @@ app.post("/api/rendezvous", async (req, res) => {
       });
     }
 
-    // Staff roles
     for (const roleId of STAFF_ROLES) {
       perms.push({
         id: roleId,
@@ -802,7 +944,6 @@ app.post("/api/rendezvous", async (req, res) => {
       });
     }
 
-    // ── Créer le salon ──
     const channel = await guild.channels.create({
       name: chanName,
       type: ChannelType.GuildText,
@@ -811,7 +952,6 @@ app.post("/api/rendezvous", async (req, res) => {
       topic: `Rendez-vous — ${discord} avec ${doctorName} le ${date} à ${heure}`,
     });
 
-    // ── Embed récapitulatif ──
     const embed = new EmbedBuilder()
       .setTitle("📅 Demande de Rendez-vous — CHL")
       .setDescription(
@@ -843,7 +983,6 @@ app.post("/api/rendezvous", async (req, res) => {
         .setStyle(ButtonStyle.Danger),
     );
 
-    // Mention patient + médecin dans le message
     const mentionPatient = patientId   ? `<@${patientId}>`      : `(${discord})`;
     const mentionDoctor  = doctorMember ? `<@${doctorDiscordId}>` : `(${doctorName})`;
     await channel.send({
