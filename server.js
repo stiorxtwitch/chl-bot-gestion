@@ -22,7 +22,7 @@ const TOKEN       = process.env.DISCORD_TOKEN;
 const GUILD_ID    = process.env.GUILD_ID              || "1384283719933628416";
 const LOG_CHANNEL = process.env.LOG_CHANNEL           || "1473699667010125986";
 const PORT        = process.env.PORT                  || 3000;
-const JWT_SECRET  = process.env.JWT_SECRET            || "chl_secret_change_moi";
+const JWT_SECRET  = process.env.JWT_SECRET            || "hlx5+HluEY0mWwnVREQzS1d8jotGb42sFr5BguMHAyM=";
 const ADMIN_URL   = process.env.ADMIN_URL             || "https://stiorxtwitch.github.io/xperthas-pharma/admin-stock.html";
 
 const TRANSCRIPT_CHANNEL_ID = process.env.TRANSCRIPT_CHANNEL_ID || "1498338598917902507";
