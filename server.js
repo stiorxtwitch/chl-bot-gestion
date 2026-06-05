@@ -1,29 +1,29 @@
-// server.js - Render.com — CHL Bot v3.2
+// server.js - Render.com — CHL Bot v3.3 (sans Google Sheets)
 // Préfixe de commandes : //
 const {
   Client, GatewayIntentBits, EmbedBuilder,
   ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder,
   ButtonStyle, ChannelType, PermissionFlagsBits, Events,
-  InteractionType, AttachmentBuilder, ModalBuilder, TextInputBuilder, TextInputStyle
+  InteractionType, AttachmentBuilder, ModalBuilder,
+  TextInputBuilder, TextInputStyle
 } = require("discord.js");
-const express      = require("express");
-const { google }   = require("googleapis");
+const express    = require("express");
 const { createCode, verifyCode } = require("./codes");
-const ts  = require("./ticketSystem");
-const cfg = require("./guildConfigs");
-const { registerStockChannel, pushStockUpdate, generateAdminToken } = require("./stockApi");
-const jwt = require("jsonwebtoken");
+const ts         = require("./ticketSystem");
+const cfg        = require("./guildConfigs");
+const { registerStockChannel, pushStockUpdate } = require("./stockApi");
+const { createClient } = require("@supabase/supabase-js");
+const jwt        = require("jsonwebtoken");
 
 // ══════════════════════════════════════════════
 //  CONFIG
 // ══════════════════════════════════════════════
 const TOKEN       = process.env.DISCORD_TOKEN;
-const GUILD_ID    = process.env.GUILD_ID    || "1384283719933628416";
-const LOG_CHANNEL = process.env.LOG_CHANNEL || "1473699667010125986";
-const SHEET_ID    = process.env.SHEET_ID    || "1jIhIbWQdbqgggYnr6gxtdAaBAlY-przeuNfb9z1UhmI";
-const PORT        = process.env.PORT        || 3000;
-const JWT_SECRET  = process.env.JWT_SECRET  || "hlx5+HluEY0mWwnVREQzS1d8jotGb42sFr5BguMHAyM=";
-const ADMIN_URL   = process.env.ADMIN_URL   || "https://stiorxtwitch.github.io/xperthas-pharma/admin-stock.html";
+const GUILD_ID    = process.env.GUILD_ID              || "1384283719933628416";
+const LOG_CHANNEL = process.env.LOG_CHANNEL           || "1473699667010125986";
+const PORT        = process.env.PORT                  || 3000;
+const JWT_SECRET  = process.env.JWT_SECRET            || "chl_secret_change_moi";
+const ADMIN_URL   = process.env.ADMIN_URL             || "https://stiorxtwitch.github.io/xperthas-pharma/admin-stock.html";
 
 const TRANSCRIPT_CHANNEL_ID = process.env.TRANSCRIPT_CHANNEL_ID || "1498338598917902507";
 
@@ -35,34 +35,102 @@ const TICKET_CATEGORIES = {
   recrutement_form : process.env.CAT_RC_FORM     || "1481346111250628770",
 };
 
-const STAFF_ROLES        = (process.env.STAFF_ROLES || "").split(",").filter(Boolean);
-const RH_ROLE            = process.env.RH_ROLE            || "1481345263510753432";
-const ROLE_RECRUTEMENT   = "1481345263510753432";
-const ROLE_TICKETS       = "1481345187958489139";
-const ROLE_LOGISTIQUE    = "1508101151046897664"; // Rôle responsable logistique (accès admin stock)
+const STAFF_ROLES      = (process.env.STAFF_ROLES || "").split(",").filter(Boolean);
+const RH_ROLE          = process.env.RH_ROLE          || "1481345263510753432";
+const ROLE_RECRUTEMENT = "1481345263510753432";
+const ROLE_TICKETS     = "1481345187958489139";
+const ROLE_LOGISTIQUE  = "1508101151046897664";
 
 const STOCK_CHANNEL_NAME = "stockage-chl";
 const STOCK_CATEGORY_ID  = process.env.CAT_STOCK || null;
 
-const SHEET_LOGS   = "Sheet1";
-const SHEET_PHARMA = "Sheet2";
-const SHEET_SOIN   = "Sheet3";
-
 const PREFIX = "//";
 
-// Items par défaut — peuvent être étendus via le panel admin
-const DEFAULT_ITEMS = [
-  "Tablette","Garrot","Pansement de terrain","Bandage élastique",
-  "Pansement hémostatique","Kit chirurgical","Pansement compressif",
-  "Injecteur d'épinéphrine","Injecteur de morphine","Propofol100ml",
-  "Propofol 250ml","Poche de sang 250ml","Poche de sang 500ml",
-  "Poche de sang 750ml","Poche de sang 1000ml","Kit de réanimation d'urgence",
-  "Moniteur ECG","Fentanyl","Ampoulier médical","Collier cervical",
-  "Accès intra-osseux(IO)","Accès intraveineux(IV)","Dispositif de massage cardiaque"
-];
+// ══════════════════════════════════════════════
+//  SUPABASE
+// ══════════════════════════════════════════════
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
+
+// ── Lire le stock depuis Supabase ──
+async function readStock(location) {
+  const { data, error } = await supabase
+    .from("stock_items")
+    .select("name, quantity")
+    .eq("location", location)
+    .order("name");
+  if (error) throw new Error(error.message);
+  const stock = {};
+  (data || []).forEach(row => { stock[row.name] = row.quantity; });
+  return stock;
+}
+
+// ── Mettre à jour la quantité d'un item ──
+async function updateStock(location, item, delta) {
+  // Récupère la quantité actuelle
+  const { data, error } = await supabase
+    .from("stock_items")
+    .select("id, quantity")
+    .eq("location", location)
+    .eq("name", item)
+    .single();
+  if (error || !data) throw new Error(`Produit "${item}" introuvable dans ${location}`);
+
+  const oldQty = data.quantity;
+  const newQty = Math.max(0, oldQty + delta);
+
+  const { error: updErr } = await supabase
+    .from("stock_items")
+    .update({ quantity: newQty, updated_at: new Date().toISOString() })
+    .eq("id", data.id);
+  if (updErr) throw new Error(updErr.message);
+
+  return { oldQty, newQty };
+}
+
+// ── Ajouter un item ──
+async function addStockItem(location, name) {
+  const { data: existing } = await supabase
+    .from("stock_items")
+    .select("id")
+    .eq("location", location)
+    .eq("name", name)
+    .single();
+  if (existing) throw new Error(`L'article "${name}" existe déjà dans ${location}.`);
+
+  const { error } = await supabase
+    .from("stock_items")
+    .insert({ location, name, quantity: 0 });
+  if (error) throw new Error(error.message);
+}
+
+// ── Logger une opération ──
+async function appendLog(discordUser, item, delta, location, newQty) {
+  await supabase.from("stock_logs").insert({
+    discord_user: discordUser,
+    item,
+    delta,
+    location,
+    new_qty: newQty,
+    logged_at: new Date().toISOString(),
+  });
+}
+
+// ── Lire les logs ──
+async function getLogs(limit = 50) {
+  const { data, error } = await supabase
+    .from("stock_logs")
+    .select("*")
+    .order("logged_at", { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
 
 // ══════════════════════════════════════════════
-//  ANTI-DOUBLONS — caches & verrous
+//  ANTI-DOUBLONS
 // ══════════════════════════════════════════════
 const handledInteractions = new Map();
 function alreadyHandled(id) {
@@ -83,112 +151,53 @@ async function withLock(key, fn) {
 }
 
 // ══════════════════════════════════════════════
-//  GOOGLE SHEETS
+//  HELPERS GÉNÉRAUX
 // ══════════════════════════════════════════════
-function loadGoogleCreds() {
-  if (process.env.GOOGLE_CREDS_B64) {
-    try {
-      return JSON.parse(Buffer.from(process.env.GOOGLE_CREDS_B64, "base64").toString("utf-8"));
-    } catch (e) { throw new Error("GOOGLE_CREDS_B64 invalide : " + e.message); }
-  }
-  if (process.env.GOOGLE_CREDS) {
-    let raw = process.env.GOOGLE_CREDS;
-    try {
-      const obj = JSON.parse(raw);
-      if (obj.private_key && obj.private_key.includes("\\n"))
-        obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-      return obj;
-    } catch (e) { throw new Error("GOOGLE_CREDS invalide : " + e.message); }
-  }
-  throw new Error("Aucune credential Google : définis GOOGLE_CREDS_B64 ou GOOGLE_CREDS");
+function isStaff(member) {
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return STAFF_ROLES.some(id => member.roles.cache.has(id));
 }
 
-let _sheetsClient = null;
-async function getSheetsClient() {
-  if (_sheetsClient) return _sheetsClient;
-  const creds = loadGoogleCreds();
-  const auth  = new google.auth.GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
-  _sheetsClient = google.sheets({ version: "v4", auth });
-  return _sheetsClient;
+function isLogistique(member) {
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return member.roles.cache.has(ROLE_LOGISTIQUE);
 }
 
-async function initSheets() {
+async function findChannelByName(guild, name, parentId) {
+  const cached = guild.channels.cache.find(
+    c => c.name === name && (!parentId || c.parentId === parentId)
+  );
+  if (cached) return cached;
   try {
-    const sheets = await getSheetsClient();
-    const r1 = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${SHEET_LOGS}!A1` });
-    if (!r1.data.values) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID, range: `${SHEET_LOGS}!A1:G1`,
-        valueInputOption: "RAW",
-        requestBody: { values: [["Date","Heure","Utilisateur","Produit","Action","Quantité","Lieu"]] }
-      });
-    }
-    for (const sheetName of [SHEET_PHARMA, SHEET_SOIN]) {
-      const r = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${sheetName}!A1` });
-      if (!r.data.values) {
-        const rows = [["Nom","Stock"], ...DEFAULT_ITEMS.map(i => [i, 0])];
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: SHEET_ID, range: `${sheetName}!A1:B${rows.length}`,
-          valueInputOption: "RAW", requestBody: { values: rows }
-        });
-      }
-    }
-    console.log("✅ Sheets initialisés");
-  } catch (err) { console.error("initSheets:", err.message); }
+    const all = await guild.channels.fetch();
+    return all.find(c => c && c.name === name && (!parentId || c.parentId === parentId)) || null;
+  } catch { return null; }
 }
 
-async function readStock(sheetName) {
-  const sheets = await getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${sheetName}!A2:B` });
-  const stock = {};
-  (res.data.values || []).forEach(row => { if (row[0]) stock[row[0]] = parseInt(row[1]) || 0; });
-  return stock;
+function buildTicketPermissions(guild, userId) {
+  const overwrites = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: userId,   allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] },
+  ];
+  for (const roleId of STAFF_ROLES)
+    overwrites.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.AttachFiles] });
+  return overwrites;
 }
 
-async function updateStock(sheetName, item, delta) {
-  const sheets   = await getSheetsClient();
-  const res      = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${sheetName}!A2:B` });
-  const rows     = res.data.values || [];
-  const rowIndex = rows.findIndex(r => r[0] === item);
-  if (rowIndex === -1) throw new Error(`Produit "${item}" introuvable dans ${sheetName}`);
-  const currentQty = parseInt(rows[rowIndex][1]) || 0;
-  const newQty     = Math.max(0, currentQty + delta);
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID, range: `${sheetName}!B${rowIndex + 2}`,
-    valueInputOption: "RAW", requestBody: { values: [[newQty]] }
-  });
-  return { oldQty: currentQty, newQty };
+function buildTicketButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("ticket_close").setLabel("🔒 Fermer le ticket").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("ticket_delete").setLabel("🗑️ Supprimer").setStyle(ButtonStyle.Danger),
+  );
 }
 
-async function addItemToSheet(sheetName, item) {
-  const sheets = await getSheetsClient();
-  const res    = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${sheetName}!A2:B` });
-  const rows   = res.data.values || [];
-  if (rows.find(r => r[0] === item)) throw new Error(`Produit "${item}" déjà existant.`);
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID, range: `${sheetName}!A:B`,
-    valueInputOption: "RAW", insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [[item, 0]] }
-  });
-}
+const TICKET_LABELS = {
+  recrutement: "Problème Recrutement",
+  question   : "Question",
+  plainte    : "Plainte Interne",
+  rendezvous : "Rendez-vous",
+};
 
-async function appendLog(user, item, delta, location) {
-  const sheets = await getSheetsClient();
-  const now    = new Date();
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID, range: `${SHEET_LOGS}!A:G`,
-    valueInputOption: "RAW", insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [[
-      now.toLocaleDateString("fr-FR"),
-      now.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }),
-      user, item, delta > 0 ? "Ajout" : "Retrait", Math.abs(delta), location
-    ]] }
-  });
-}
-
-// ══════════════════════════════════════════════
-//  HELPER — Transcript
-// ══════════════════════════════════════════════
 async function generateTranscript(channel) {
   const lines = [];
   lines.push(`═══════════════════════════════════════════════`);
@@ -220,38 +229,6 @@ async function generateTranscript(channel) {
   return lines.join("\n");
 }
 
-// ══════════════════════════════════════════════
-//  HELPERS TICKETS
-// ══════════════════════════════════════════════
-function buildTicketPermissions(guild, userId) {
-  const overwrites = [
-    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-    { id: userId,   allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] },
-  ];
-  for (const roleId of STAFF_ROLES)
-    overwrites.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.AttachFiles] });
-  return overwrites;
-}
-
-function isStaff(member) {
-  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-  return STAFF_ROLES.some(id => member.roles.cache.has(id));
-}
-
-function isLogistique(member) {
-  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-  return member.roles.cache.has(ROLE_LOGISTIQUE);
-}
-
-async function findChannelByName(guild, name, parentId) {
-  const cached = guild.channels.cache.find(c => c.name === name && (!parentId || c.parentId === parentId));
-  if (cached) return cached;
-  try {
-    const all = await guild.channels.fetch();
-    return all.find(c => c && c.name === name && (!parentId || c.parentId === parentId)) || null;
-  } catch { return null; }
-}
-
 async function sendTicketPanel(channel) {
   const embed = new EmbedBuilder()
     .setTitle("🏥 Support — Centre Hospitalier de Liège")
@@ -280,48 +257,36 @@ async function sendTicketPanel(channel) {
   await channel.send({ embeds: [embed], components: [row] });
 }
 
-function buildTicketButtons() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("ticket_close").setLabel("🔒 Fermer le ticket").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("ticket_delete").setLabel("🗑️ Supprimer").setStyle(ButtonStyle.Danger),
-  );
-}
-
-const TICKET_LABELS = {
-  recrutement: "Problème Recrutement",
-  question   : "Question",
-  plainte    : "Plainte Interne",
-  rendezvous : "Rendez-vous",
-};
-
 // ══════════════════════════════════════════════
-//  STOCK — Helpers
+//  STOCK — Helpers Discord
 // ══════════════════════════════════════════════
-
-// Construit le message principal du channel stockage
-async function buildStockPanelMessage(guild, channelId) {
-  const pharmStock = await readStock(SHEET_PHARMA);
-  const soinStock  = await readStock(SHEET_SOIN);
+async function buildStockPanelMessage() {
+  const pharmStock = await readStock("Pharmacie");
+  const soinStock  = await readStock("Soin");
   const totalPharm = Object.values(pharmStock).reduce((s, v) => s + v, 0);
   const totalSoin  = Object.values(soinStock).reduce((s, v) => s + v, 0);
-  const lowPharm   = Object.entries(pharmStock).filter(([, q]) => q < 5).map(([i]) => i);
-  const lowSoin    = Object.entries(soinStock).filter(([, q]) => q < 5).map(([i]) => i);
+  const lowPharm   = Object.entries(pharmStock).filter(([, q]) => q > 0 && q < 5).map(([i]) => i);
+  const lowSoin    = Object.entries(soinStock).filter(([, q]) => q > 0 && q < 5).map(([i]) => i);
+  const emptyPharm = Object.entries(pharmStock).filter(([, q]) => q === 0).map(([i]) => i);
+  const emptySoin  = Object.entries(soinStock).filter(([, q]) => q === 0).map(([i]) => i);
+
+  let desc =
+    "Sélectionnez un lieu puis un article pour effectuer un retrait.\n\n" +
+    `🏥 **Pharmacie** — ${totalPharm} unité(s)\n` +
+    `🩺 **Soins** — ${totalSoin} unité(s)`;
+
+  if (lowPharm.length || lowSoin.length)
+    desc += `\n\n⚠️ **Stock faible :** ${[...lowPharm, ...lowSoin].join(", ")}`;
+  if (emptyPharm.length || emptySoin.length)
+    desc += `\n🔴 **Rupture :** ${[...emptyPharm, ...emptySoin].join(", ")}`;
 
   const embed = new EmbedBuilder()
     .setTitle("📦 Centre de Stockage — CHL")
-    .setDescription(
-      "Bienvenue dans le centre de gestion du stock hospitalier.\n" +
-      "Sélectionnez un lieu et un article pour retirer du stock.\n\n" +
-      `🏥 **Pharmacie** — ${totalPharm} unités totales\n` +
-      `🩺 **Soins** — ${totalSoin} unités totales` +
-      (lowPharm.length ? `\n\n⚠️ **Stock faible Pharmacie :** ${lowPharm.join(", ")}` : "") +
-      (lowSoin.length  ? `\n⚠️ **Stock faible Soins :** ${lowSoin.join(", ")}`         : "")
-    )
+    .setDescription(desc)
     .setColor(0x004080)
-    .setFooter({ text: `CHL — Dernière mise à jour` })
+    .setFooter({ text: "CHL — Dernière mise à jour" })
     .setTimestamp();
 
-  // Ligne 1 : choix du lieu
   const locationRow = new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId("stock_pick_location")
@@ -332,7 +297,6 @@ async function buildStockPanelMessage(guild, channelId) {
       ])
   );
 
-  // Ligne 2 : boutons rapides
   const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("stock_refresh_panel").setLabel("🔄 Actualiser").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("stock_view_logs").setLabel("📋 Historique").setStyle(ButtonStyle.Secondary),
@@ -341,19 +305,15 @@ async function buildStockPanelMessage(guild, channelId) {
   return { embeds: [embed], components: [locationRow, actionRow] };
 }
 
-// Construit les options de retrait pour un lieu donné (max 25 options Discord)
 async function buildItemSelectRow(location) {
-  const sheetName = location === "Pharmacie" ? SHEET_PHARMA : SHEET_SOIN;
-  const stock     = await readStock(sheetName);
+  const stock     = await readStock(location);
   const available = Object.entries(stock).filter(([, q]) => q > 0);
-
   if (available.length === 0) return null;
 
-  // Discord limite à 25 options max par menu
   const options = available.slice(0, 25).map(([item, qty]) => ({
     label      : item.substring(0, 25),
     value      : `${location}::${item}`,
-    description: `Stock disponible : ${qty}`,
+    description: `Disponible : ${qty}`,
     emoji      : qty < 5 ? "🟠" : "🟢",
   }));
 
@@ -365,11 +325,21 @@ async function buildItemSelectRow(location) {
   );
 }
 
+async function refreshStockPanel(guild) {
+  try {
+    const stockCh = await findChannelByName(guild, STOCK_CHANNEL_NAME, STOCK_CATEGORY_ID);
+    if (!stockCh) return;
+    const messages = await stockCh.messages.fetch({ limit: 10 });
+    const panelMsg = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0);
+    if (panelMsg) await panelMsg.edit(await buildStockPanelMessage());
+  } catch (_) {}
+}
+
 // ══════════════════════════════════════════════
-//  BOT — Singleton
+//  BOT DISCORD
 // ══════════════════════════════════════════════
 if (global.__chl_bot_started) {
-  console.warn("⚠️ Tentative de double-démarrage du bot ignorée.");
+  console.warn("⚠️ Double-démarrage ignoré.");
 } else {
   global.__chl_bot_started = true;
 }
@@ -386,12 +356,11 @@ const client = new Client({
 
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot connecté : ${client.user.tag}`);
-  console.log(`📌 Préfixe actif : ${PREFIX}`);
-  await initSheets();
+  console.log(`📌 Préfixe : ${PREFIX}`);
 });
 
-process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
-process.on("uncaughtException",  (err) => console.error("uncaughtException :", err));
+process.on("unhandledRejection", err => console.error("unhandledRejection:", err));
+process.on("uncaughtException",  err => console.error("uncaughtException :", err));
 
 // ══════════════════════════════════════════════
 //  COMMANDES PRÉFIXE "//"
@@ -401,133 +370,106 @@ client.on(Events.MessageCreate, async (message) => {
   if (!message.guild)     return;
   if (!message.content.startsWith(PREFIX)) return;
 
-  const raw    = message.content.slice(PREFIX.length).trim();
-  const args   = raw.split(/\s+/);
-  const cmd    = args.shift().toLowerCase();
-  const guild  = message.guild;
-  const member = message.member;
+  const raw     = message.content.slice(PREFIX.length).trim();
+  const args    = raw.split(/\s+/);
+  const cmd     = args.shift().toLowerCase();
+  const guild   = message.guild;
+  const member  = message.member;
   const channel = message.channel;
 
   try {
 
-    // ── //stock ────────────────────────────────
+    // ── //stock ──────────────────────────────────────────────────
     if (cmd === "stock") {
       if (!isStaff(member)) return message.reply("❌ Staff uniquement.");
 
-      await message.reply("⏳ Vérification en cours...");
+      const sub = (args[0] || "").toLowerCase();
 
+      // //stock refresh
+      if (sub === "refresh") {
+        const ch = await findChannelByName(guild, STOCK_CHANNEL_NAME, STOCK_CATEGORY_ID);
+        if (!ch) return message.reply("❌ Aucun salon stockage trouvé. Lance `//stock` d'abord.");
+        await refreshStockPanel(guild);
+        return message.reply("✅ Panel stockage rafraîchi !");
+      }
+
+      // //stock (création)
       return withLock("stock_channel_create", async () => {
-        try {
-          // Anti-doublon : vérifier si le channel existe déjà
-          const existing = await findChannelByName(guild, STOCK_CHANNEL_NAME, STOCK_CATEGORY_ID);
-          if (existing) {
-            return message.reply(
-              `⚠️ Le salon de stockage existe déjà : <#${existing.id}>\n` +
-              `Utilisez \`//stock refresh\` pour rafraîchir le panel.`
-            );
-          }
+        const existing = await findChannelByName(guild, STOCK_CHANNEL_NAME, STOCK_CATEGORY_ID);
+        if (existing)
+          return message.reply(`⚠️ Salon déjà existant : <#${existing.id}>\nUtilise \`//stock refresh\` pour rafraîchir le panel.`);
 
-          // Sous-commande refresh
-          if ((args[0] || "").toLowerCase() === "refresh") {
-            const ch = await findChannelByName(guild, STOCK_CHANNEL_NAME, STOCK_CATEGORY_ID);
-            if (!ch) return message.reply("❌ Aucun salon stockage trouvé. Lancez `//stock` d'abord.");
-            const panelMsg = await buildStockPanelMessage(guild, ch.id);
-            await ch.bulkDelete(5).catch(() => {});
-            await ch.send(panelMsg);
-            return message.reply("✅ Panel stockage rafraîchi !");
-          }
-
-          // Créer le channel — lecture seule pour tout le monde, staff complet
-          const overwrites = [
-            {
-              id   : guild.id,
-              allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-              deny : [PermissionFlagsBits.SendMessages],
-            },
-          ];
-          for (const roleId of STAFF_ROLES) {
-            overwrites.push({
-              id   : roleId,
-              allow: [
-                PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.ManageMessages,
-              ],
-            });
-          }
-          // Le rôle logistique peut aussi voir et interagir
-          overwrites.push({
+        const overwrites = [
+          {
+            id   : guild.id,
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+            deny : [PermissionFlagsBits.SendMessages],
+          },
+          {
             id   : ROLE_LOGISTIQUE,
             allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
             deny : [PermissionFlagsBits.SendMessages],
+          },
+        ];
+        for (const roleId of STAFF_ROLES) {
+          overwrites.push({
+            id   : roleId,
+            allow: [
+              PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels,
+              PermissionFlagsBits.ManageMessages,
+            ],
           });
-
-          const stockChannel = await guild.channels.create({
-            name                : STOCK_CHANNEL_NAME,
-            type                : ChannelType.GuildText,
-            parent              : STOCK_CATEGORY_ID || undefined,
-            permissionOverwrites: overwrites,
-            topic               : "📦 Gestion du stock — Centre Hospitalier de Liège",
-          });
-
-          // Enregistrer dans Supabase
-          const apiResult = await registerStockChannel(stockChannel.id, guild.id, stockChannel.name);
-          if (!apiResult.success) console.warn("⚠️ Supabase registerStockChannel :", apiResult.error);
-
-          // Envoyer le panel interactif
-          const panelMsg = await buildStockPanelMessage(guild, stockChannel.id);
-          await stockChannel.send(panelMsg);
-
-          // Message privé au staff avec lien admin (token JWT)
-          const token = jwt.sign(
-            { userId: member.user.id, guildId: guild.id, role: "logistique" },
-            JWT_SECRET, { expiresIn: "1h" }
-          );
-          try {
-            await member.send(
-              `✅ **Salon stockage créé :** <#${stockChannel.id}>\n\n` +
-              `🔐 **Lien panel admin logistique (valide 1h) :**\n` +
-              `${ADMIN_URL}?token=${token}`
-            );
-          } catch (_) {}
-
-          return message.reply(
-            `✅ Salon <#${stockChannel.id}> créé avec succès !\n` +
-            `📬 Le lien admin t'a été envoyé en DM.`
-          );
-
-        } catch (err) {
-          console.error("//stock :", err);
-          return message.reply(`❌ Erreur : ${err.message}`);
         }
+
+        const stockChannel = await guild.channels.create({
+          name                : STOCK_CHANNEL_NAME,
+          type                : ChannelType.GuildText,
+          parent              : STOCK_CATEGORY_ID || undefined,
+          permissionOverwrites: overwrites,
+          topic               : "📦 Gestion du stock — Centre Hospitalier de Liège",
+        });
+
+        // Enregistrer dans Supabase
+        await registerStockChannel(stockChannel.id, guild.id, stockChannel.name).catch(e => console.warn("Supabase register:", e.message));
+
+        // Envoyer le panel
+        const panelMsg = await buildStockPanelMessage();
+        await stockChannel.send(panelMsg);
+
+        // Lien admin en DM
+        const token = jwt.sign(
+          { userId: member.user.id, guildId: guild.id, role: "logistique" },
+          JWT_SECRET, { expiresIn: "1h" }
+        );
+        await member.send(
+          `✅ **Salon stockage créé :** <#${stockChannel.id}>\n\n` +
+          `🔐 **Lien panel admin (valide 1h) :**\n${ADMIN_URL}?token=${token}`
+        ).catch(() => {});
+
+        return message.reply(`✅ Salon <#${stockChannel.id}> créé ! Lien admin envoyé en DM.`);
       });
     }
 
-    // ── //stock_admin (génère un lien admin pour un responsable logistique) ──
+    // ── //stock_admin @membre ────────────────────────────────────
     if (cmd === "stock_admin") {
       if (!isStaff(member)) return message.reply("❌ Staff uniquement.");
-
-      const targetMention = message.mentions.members.first();
-      if (!targetMention) return message.reply("❌ Mention un membre : `//stock_admin @membre`");
-      if (!isLogistique(targetMention) && !isStaff(targetMention))
+      const target = message.mentions.members.first();
+      if (!target) return message.reply("❌ Mentionne un membre : `//stock_admin @membre`");
+      if (!isLogistique(target) && !isStaff(target))
         return message.reply("❌ Ce membre n'a pas le rôle Logistique.");
-
       const token = jwt.sign(
-        { userId: targetMention.user.id, guildId: guild.id, role: "logistique" },
+        { userId: target.user.id, guildId: guild.id, role: "logistique" },
         JWT_SECRET, { expiresIn: "1h" }
       );
-      try {
-        await targetMention.send(
-          `🔐 **Lien panel admin stock CHL (valide 1h) :**\n${ADMIN_URL}?token=${token}\n\n` +
-          `Ce lien est personnel et ne doit pas être partagé.`
-        );
-        return message.reply(`✅ Lien admin envoyé en DM à ${targetMention.user.tag}.`);
-      } catch (_) {
-        return message.reply("❌ Impossible d'envoyer un DM à ce membre.");
-      }
+      await target.send(
+        `🔐 **Lien panel admin stock CHL (valide 1h) :**\n${ADMIN_URL}?token=${token}\n\n` +
+        `⚠️ Ce lien est personnel, ne le partage pas.`
+      ).catch(() => { return message.reply("❌ Impossible d'envoyer un DM à ce membre."); });
+      return message.reply(`✅ Lien admin envoyé en DM à ${target.user.tag}.`);
     }
 
-    // ── //ticket_panel ──
+    // ── //ticket_panel ───────────────────────────────────────────
     if (cmd === "ticket_panel") {
       if (!member.permissions.has(PermissionFlagsBits.Administrator))
         return message.reply("❌ Administrateur uniquement.");
@@ -536,19 +478,18 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // ── //fermer ──
+    // ── //fermer ─────────────────────────────────────────────────
     if (cmd === "fermer") {
       if (!isStaff(member)) return message.reply("❌ Staff uniquement.");
       await message.reply("🔒 Ticket fermé.");
-      for (const [id] of channel.permissionOverwrites.cache) {
+      for (const [id] of channel.permissionOverwrites.cache)
         if (!STAFF_ROLES.includes(id) && id !== guild.id)
           await channel.permissionOverwrites.edit(id, { SendMessages: false }).catch(() => {});
-      }
       await channel.setName("fermé-" + channel.name).catch(() => {});
       return;
     }
 
-    // ── //supprimer ──
+    // ── //supprimer ──────────────────────────────────────────────
     if (cmd === "supprimer") {
       if (!isStaff(member)) return message.reply("❌ Staff uniquement.");
       await message.reply("🗑️ Suppression dans 5 secondes...");
@@ -556,39 +497,39 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // ── //delete <oui|non> <raison...> ──
+    // ── //delete <oui|non> <raison> ──────────────────────────────
     if (cmd === "delete") {
       if (!isStaff(member)) return message.reply("❌ Staff uniquement.");
       const doTranscript = (args[0] || "non").toLowerCase() === "oui";
       const raison       = args.slice(1).join(" ") || "Aucune raison fournie";
-      const confirmEmbed = new EmbedBuilder()
-        .setTitle("🗑️ Ticket en cours de suppression")
-        .setDescription(
-          `Ce ticket va être supprimé dans **5 secondes**.\n\n` +
-          `**Raison :** ${raison}\n` +
-          `**Transcript :** ${doTranscript ? "✅ Oui" : "❌ Non"}\n` +
-          `**Fermé par :** ${member.user.tag}`
-        )
-        .setColor(0xe74c3c).setTimestamp().setFooter({ text: "CHL — Gestion des tickets" });
-      await channel.send({ embeds: [confirmEmbed] });
+      await channel.send({ embeds: [
+        new EmbedBuilder()
+          .setTitle("🗑️ Ticket en cours de suppression")
+          .setDescription(
+            `Ce ticket va être supprimé dans **5 secondes**.\n\n` +
+            `**Raison :** ${raison}\n` +
+            `**Transcript :** ${doTranscript ? "✅ Oui" : "❌ Non"}\n` +
+            `**Fermé par :** ${member.user.tag}`
+          )
+          .setColor(0xe74c3c).setTimestamp().setFooter({ text: "CHL — Gestion des tickets" })
+      ]});
       if (doTranscript) {
         try {
-          const text       = await generateTranscript(channel);
-          const fileName   = `transcript-${channel.name}-${Date.now()}.txt`;
-          const attachment = new AttachmentBuilder(Buffer.from(text, "utf-8"), { name: fileName });
+          const text = await generateTranscript(channel);
+          const att  = new AttachmentBuilder(Buffer.from(text, "utf-8"), { name: `transcript-${channel.name}-${Date.now()}.txt` });
           const tEmbed = new EmbedBuilder()
             .setTitle("📄 Transcript de ticket")
             .setDescription(`**Salon :** #${channel.name}\n**Raison :** ${raison}\n**Fermé par :** ${member.user.tag} (<@${member.user.id}>)\n**Date :** ${new Date().toLocaleString("fr-FR")}`)
             .setColor(0x004080).setTimestamp().setFooter({ text: "CHL — Transcripts" });
           const tCh = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
-          await tCh.send({ embeds: [tEmbed], files: [attachment] });
-        } catch (err) { console.error("Erreur transcript //delete :", err.message); }
+          await tCh.send({ embeds: [tEmbed], files: [att] });
+        } catch (err) { console.error("Erreur transcript:", err.message); }
       }
       setTimeout(() => channel.delete().catch(() => {}), 5000);
       return;
     }
 
-    // ── //attente / valider / refuser ──
+    // ── //attente / valider / refuser ────────────────────────────
     if (cmd === "attente") {
       if (!isStaff(member) && !member.roles.cache.has(RH_ROLE)) return message.reply("❌ RH / Staff uniquement.");
       return channel.send({ embeds: [new EmbedBuilder().setTitle("⏳ Candidature en attente").setDescription("Votre candidature est actuellement **en cours d'examen** par notre équipe RH.\n\nNous reviendrons vers vous dans les plus brefs délais. Merci de votre patience.").setColor(0xf0a500).setTimestamp().setFooter({ text: `Traité par ${member.user.tag}` })] });
@@ -602,7 +543,7 @@ client.on(Events.MessageCreate, async (message) => {
       return channel.send({ embeds: [new EmbedBuilder().setTitle("❌ Candidature refusée").setDescription("Nous avons bien examiné votre candidature, mais nous ne sommes pas en mesure de vous intégrer pour le moment.\n\nNous vous remercions de l'intérêt que vous portez au Centre Hospitalier de Liège et vous encourageons à repostuler dans le futur.\n\nCordialement, l'équipe RH 🏥").setColor(0xc0392b).setTimestamp().setFooter({ text: `Refusé par ${member.user.tag}` })] });
     }
 
-    // ── //ticket <sous-commande> ──
+    // ── //ticket <sous-commande> ─────────────────────────────────
     if (cmd === "ticket") {
       const sub = (args.shift() || "").toLowerCase();
       if (sub === "setup") {
@@ -616,7 +557,7 @@ client.on(Events.MessageCreate, async (message) => {
       if (sub === "panel") {
         if (!member.permissions.has(PermissionFlagsBits.Administrator)) return message.reply("❌ Administrateur uniquement.");
         const config = cfg.get(guild.id);
-        if (!config || config.ticketTypes.length === 0) return message.reply("❌ Aucun type configuré. Lancez d'abord `//ticket setup`.");
+        if (!config || config.ticketTypes.length === 0) return message.reply("❌ Aucun type configuré. Lance `//ticket setup`.");
         await ts.deployPanel(channel, config, guild);
         await message.delete().catch(() => {});
         return;
@@ -625,10 +566,9 @@ client.on(Events.MessageCreate, async (message) => {
         const config = cfg.get(guild.id) || {};
         if (!ts.isStaffOrAdmin(member, config)) return message.reply("❌ Staff uniquement.");
         await message.reply("🔒 Ticket fermé.");
-        for (const [id] of channel.permissionOverwrites.cache) {
+        for (const [id] of channel.permissionOverwrites.cache)
           if (!(config.staffRoles || []).includes(id) && id !== guild.id)
             await channel.permissionOverwrites.edit(id, { SendMessages: false }).catch(() => {});
-        }
         await channel.setName(`fermé-${channel.name}`.substring(0, 100)).catch(() => {});
         return;
       }
@@ -641,17 +581,18 @@ client.on(Events.MessageCreate, async (message) => {
           try {
             const text = await ts.generateTranscript(channel);
             const att  = new AttachmentBuilder(Buffer.from(text, "utf-8"), { name: `transcript-${channel.name}-${Date.now()}.txt` });
-            const tEmbed = new EmbedBuilder().setTitle("📄 Transcript de ticket").setDescription(`**Salon :** #${channel.name}\n**Raison :** ${raison}\n**Fermé par :** ${member.user.tag} (<@${member.user.id}>)\n**Date :** ${new Date().toLocaleString("fr-FR")}`).setColor(0x004080).setTimestamp();
+            const tEmbed = new EmbedBuilder().setTitle("📄 Transcript").setDescription(`**Salon :** #${channel.name}\n**Raison :** ${raison}\n**Par :** ${member.user.tag}`).setColor(0x004080).setTimestamp();
             if (config.transcriptChannelId) { const tc = await client.channels.fetch(config.transcriptChannelId); await tc.send({ embeds: [tEmbed], files: [att] }); }
-          } catch (err) { console.error("transcript //ticket supprimer:", err.message); }
+          } catch (err) { console.error("transcript:", err.message); }
         }
-        await channel.send({ embeds: [new EmbedBuilder().setTitle("🗑️ Ticket en cours de suppression").setDescription(`Ce ticket sera supprimé dans **5 secondes**.\n\n**Raison :** ${raison}\n**Transcript :** ${doTranscript ? "✅ Oui" : "❌ Non"}\n**Par :** ${member.user.tag}`).setColor(0xe74c3c).setTimestamp()] });
+        await channel.send({ embeds: [new EmbedBuilder().setTitle("🗑️ Suppression dans 5s").setDescription(`**Raison :** ${raison}\n**Transcript :** ${doTranscript ? "✅" : "❌"}\n**Par :** ${member.user.tag}`).setColor(0xe74c3c).setTimestamp()] });
         setTimeout(() => channel.delete().catch(() => {}), 5000);
         return;
       }
-      return channel.send({ embeds: [new EmbedBuilder().setTitle("📖 Aide — //ticket").addFields({ name: "`//ticket setup`", value: "Configurer le système *(Admin)*" }, { name: "`//ticket panel`", value: "Déployer le panel *(Admin)*" }, { name: "`//ticket fermer`", value: "Fermer ce ticket" }, { name: "`//ticket supprimer [oui|non] [raison]`", value: "Supprimer avec ou sans transcript" }).setColor(0x004080).setTimestamp()] });
+      return channel.send({ embeds: [new EmbedBuilder().setTitle("📖 Aide — //ticket").addFields({ name: "`//ticket setup`", value: "Configurer *(Admin)*" }, { name: "`//ticket panel`", value: "Déployer le panel *(Admin)*" }, { name: "`//ticket fermer`", value: "Fermer ce ticket" }, { name: "`//ticket supprimer [oui|non] [raison]`", value: "Supprimer avec/sans transcript" }).setColor(0x004080).setTimestamp()] });
     }
 
+    // ── //aide ───────────────────────────────────────────────────
     if (cmd === "aide" || cmd === "help") {
       return channel.send({ embeds: [
         new EmbedBuilder()
@@ -661,9 +602,9 @@ client.on(Events.MessageCreate, async (message) => {
             { name: "🏥 Tickets CHL",          value: "`//ticket_panel`\n`//fermer`\n`//supprimer`\n`//delete <oui|non> <raison>`" },
             { name: "👔 Recrutement",           value: "`//attente`\n`//valider`\n`//refuser`" },
             { name: "🎫 Tickets configurables", value: "`//ticket setup`\n`//ticket panel`\n`//ticket fermer`\n`//ticket supprimer [oui|non] [raison]`" },
-            { name: "📦 Stock",                 value: "`//stock` — Crée le salon stockage\n`//stock refresh` — Rafraîchit le panel\n`//stock_admin @membre` — Envoie un lien admin en DM" },
+            { name: "📦 Stock",                 value: "`//stock` — Crée le salon\n`//stock refresh` — Rafraîchit le panel\n`//stock_admin @membre` — Lien admin en DM" },
           )
-          .setColor(0x004080).setTimestamp().setFooter({ text: "CHL Bot v3.2" })
+          .setColor(0x004080).setTimestamp().setFooter({ text: "CHL Bot v3.3" })
       ]});
     }
 
@@ -677,10 +618,7 @@ client.on(Events.MessageCreate, async (message) => {
 //  INTERACTIONS
 // ══════════════════════════════════════════════
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (alreadyHandled(interaction.id)) {
-    console.warn("⚠️ Interaction dupliquée ignorée :", interaction.id);
-    return;
-  }
+  if (alreadyHandled(interaction.id)) return;
   const guild = interaction.guild;
 
   try {
@@ -700,174 +638,143 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith("tticket_"))
       return ts.onTicketButton(interaction, client);
 
-    // ════════════════════════════════════════════
+    // ════════════════════════════════════════
     //  STOCK — Étape 1 : choix du lieu
-    // ════════════════════════════════════════════
+    // ════════════════════════════════════════
     if (interaction.isStringSelectMenu() && interaction.customId === "stock_pick_location") {
-      const location = interaction.values[0]; // "Pharmacie" | "Soin"
+      const location = interaction.values[0];
       await interaction.deferReply({ ephemeral: true });
-
       const itemRow = await buildItemSelectRow(location);
-      if (!itemRow) {
+      if (!itemRow)
         return interaction.editReply({ content: `❌ Aucun article disponible en **${location}** pour le moment.` });
-      }
-
-      const stockEmbed = new EmbedBuilder()
-        .setTitle(`📦 ${location} — Sélection d'article`)
-        .setDescription("Choisissez un article à retirer du stock.\nUne confirmation vous sera demandée.")
-        .setColor(location === "Pharmacie" ? 0x004080 : 0x27ae60)
-        .setFooter({ text: "CHL — Les articles en 🟠 sont en stock faible" });
-
-      return interaction.editReply({ embeds: [stockEmbed], components: [itemRow] });
+      return interaction.editReply({
+        embeds: [new EmbedBuilder()
+          .setTitle(`📦 ${location} — Choix de l'article`)
+          .setDescription("Sélectionne l'article à retirer. Une confirmation te sera demandée.")
+          .setColor(location === "Pharmacie" ? 0x004080 : 0x27ae60)
+          .setFooter({ text: "🟠 = stock faible  |  🟢 = stock OK" })],
+        components: [itemRow],
+      });
     }
 
-    // ════════════════════════════════════════════
-    //  STOCK — Étape 2 : choix de l'article
-    //  → ouvre une modale pour la quantité
-    // ════════════════════════════════════════════
+    // ════════════════════════════════════════
+    //  STOCK — Étape 2 : choix de l'article → modale quantité
+    // ════════════════════════════════════════
     if (interaction.isStringSelectMenu() && interaction.customId === "stock_pick_item") {
       const [location, ...itemParts] = interaction.values[0].split("::");
       const item = itemParts.join("::");
+      const stock = await readStock(location);
+      const qty   = stock[item] ?? 0;
 
       const modal = new ModalBuilder()
         .setCustomId(`stock_confirm::${location}::${item}`)
         .setTitle(`Retrait — ${item.substring(0, 30)}`);
-
-      const qtyInput = new TextInputBuilder()
-        .setCustomId("qty")
-        .setLabel(`Quantité à retirer (stock : ${await getItemQty(location, item)})`)
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder("Ex: 2")
-        .setRequired(true)
-        .setMinLength(1)
-        .setMaxLength(4);
-
-      modal.addComponents(new ActionRowBuilder().addComponents(qtyInput));
+      modal.addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("qty")
+          .setLabel(`Quantité à retirer (stock actuel : ${qty})`)
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder("Ex : 2")
+          .setRequired(true)
+          .setMinLength(1)
+          .setMaxLength(4)
+      ));
       return interaction.showModal(modal);
     }
 
-    // ════════════════════════════════════════════
-    //  STOCK — Étape 3 : confirmation modale
-    // ════════════════════════════════════════════
+    // ════════════════════════════════════════
+    //  STOCK — Étape 3 : validation modale
+    // ════════════════════════════════════════
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId.startsWith("stock_confirm::")) {
       const parts    = interaction.customId.split("::");
       const location = parts[1];
       const item     = parts.slice(2).join("::");
-      const qtyRaw   = interaction.fields.getTextInputValue("qty");
-      const qty      = parseInt(qtyRaw);
+      const qty      = parseInt(interaction.fields.getTextInputValue("qty"));
 
       if (isNaN(qty) || qty <= 0)
-        return interaction.reply({ content: "❌ Quantité invalide (doit être un entier positif).", ephemeral: true });
+        return interaction.reply({ content: "❌ Quantité invalide.", ephemeral: true });
 
       await interaction.deferReply({ ephemeral: true });
 
-      return withLock(`stock_update:${location}:${item}`, async () => {
+      return withLock(`stock:${location}:${item}`, async () => {
+        // Vérifier le stock avant
+        const stock  = await readStock(location);
+        const before = stock[item] ?? 0;
+        if (before < qty)
+          return interaction.editReply({ content: `❌ Stock insuffisant. Disponible : **${before}**.` });
+
+        const { oldQty, newQty } = await updateStock(location, item, -qty);
+        await appendLog(interaction.user.tag, item, -qty, location, newQty);
+
+        // Log Discord
         try {
-          const sheetName = location === "Pharmacie" ? SHEET_PHARMA : SHEET_SOIN;
-          const { oldQty, newQty } = await updateStock(sheetName, item, -qty);
-
-          if (oldQty < qty) {
-            return interaction.editReply({ content: `❌ Stock insuffisant. Disponible : **${oldQty}**.` });
-          }
-
-          await appendLog(interaction.user.tag, item, -qty, location);
-
-          // Log dans le channel de logs Discord
-          try {
-            const logChannel = await client.channels.fetch(LOG_CHANNEL);
-            const logEmbed = new EmbedBuilder()
+          const logCh = await client.channels.fetch(LOG_CHANNEL);
+          await logCh.send({ content: `<@${interaction.user.id}>`, embeds: [
+            new EmbedBuilder()
               .setTitle("📦 Retrait de Stock")
               .setDescription(`<@${interaction.user.id}> a retiré du stock.`)
               .addFields(
-                { name: "Produit",   value: item,         inline: true },
-                { name: "Quantité",  value: `${qty}`,     inline: true },
-                { name: "Lieu",      value: location,     inline: true },
-                { name: "Avant",     value: `${oldQty}`,  inline: true },
-                { name: "Après",     value: `${newQty}`,  inline: true },
+                { name: "Produit",   value: item,       inline: true },
+                { name: "Quantité",  value: `${qty}`,   inline: true },
+                { name: "Lieu",      value: location,   inline: true },
+                { name: "Avant",     value: `${oldQty}`,inline: true },
+                { name: "Après",     value: `${newQty}`,inline: true },
               )
               .setColor(0xe74c3c).setTimestamp()
-              .setFooter({ text: `CHL Stock — ${interaction.user.tag}` });
-            await logChannel.send({ content: `<@${interaction.user.id}>`, embeds: [logEmbed] });
-          } catch (_) {}
+              .setFooter({ text: interaction.user.tag })
+          ]});
+        } catch (_) {}
 
-          // Notifier Supabase
-          await pushStockUpdate({
-            channelId: interaction.channelId, guildId: guild.id,
-            user: interaction.user.tag, item, delta: -qty, location, newQty,
-          }).catch(() => {});
+        // Notifier Supabase
+        await pushStockUpdate({ channelId: interaction.channelId, guildId: guild.id, user: interaction.user.tag, item, delta: -qty, location, newQty }).catch(() => {});
 
-          // Mettre à jour le panel stockage (rafraîchir l'embed du channel)
-          try {
-            const stockCh = await findChannelByName(guild, STOCK_CHANNEL_NAME, STOCK_CATEGORY_ID);
-            if (stockCh) {
-              const messages  = await stockCh.messages.fetch({ limit: 5 });
-              const panelMsg  = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0);
-              if (panelMsg) {
-                const newPanel = await buildStockPanelMessage(guild, stockCh.id);
-                await panelMsg.edit(newPanel);
-              }
-            }
-          } catch (_) {}
+        // Rafraîchir le panel
+        await refreshStockPanel(guild);
 
-          const confirmEmbed = new EmbedBuilder()
+        return interaction.editReply({ embeds: [
+          new EmbedBuilder()
             .setTitle("✅ Retrait confirmé")
             .addFields(
-              { name: "Article",     value: item,        inline: true },
-              { name: "Quantité",    value: `${qty}`,    inline: true },
-              { name: "Lieu",        value: location,    inline: true },
-              { name: "Nouveau stock", value: `${newQty}`, inline: true },
+              { name: "Article",       value: item,       inline: true },
+              { name: "Quantité",      value: `${qty}`,   inline: true },
+              { name: "Lieu",          value: location,   inline: true },
+              { name: "Nouveau stock", value: `${newQty}`,inline: true },
             )
             .setColor(0x27ae60).setTimestamp()
-            .setFooter({ text: `Retiré par ${interaction.user.tag}` });
-
-          return interaction.editReply({ embeds: [confirmEmbed] });
-
-        } catch (err) {
-          console.error("stock_confirm:", err);
-          return interaction.editReply({ content: `❌ Erreur : ${err.message}` });
-        }
+            .setFooter({ text: `Retiré par ${interaction.user.tag}` })
+        ]});
       });
     }
 
-    // ── Stock — Bouton Actualiser panel ──
+    // ── Stock — Actualiser ──
     if (interaction.isButton() && interaction.customId === "stock_refresh_panel") {
       await interaction.deferReply({ ephemeral: true });
-      try {
-        const stockCh = await findChannelByName(guild, STOCK_CHANNEL_NAME, STOCK_CATEGORY_ID);
-        if (stockCh) {
-          const messages = await stockCh.messages.fetch({ limit: 5 });
-          const panelMsg = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0);
-          if (panelMsg) {
-            const newPanel = await buildStockPanelMessage(guild, stockCh.id);
-            await panelMsg.edit(newPanel);
-          }
-        }
-        return interaction.editReply({ content: "✅ Panel actualisé." });
-      } catch (err) {
-        return interaction.editReply({ content: `❌ ${err.message}` });
-      }
+      await refreshStockPanel(guild);
+      return interaction.editReply({ content: "✅ Panel actualisé." });
     }
 
-    // ── Stock — Bouton Historique ──
+    // ── Stock — Historique ──
     if (interaction.isButton() && interaction.customId === "stock_view_logs") {
       await interaction.deferReply({ ephemeral: true });
-      try {
-        const sheets = await getSheetsClient();
-        const result = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${SHEET_LOGS}!A2:G` });
-        const rows   = (result.data.values || []).slice(-10).reverse();
-        if (!rows.length) return interaction.editReply({ content: "📋 Aucun log trouvé." });
-        const lines  = rows.map(r => `\`${r[0]} ${r[1]}\` — **${r[2]}** | ${r[4]} **${r[3]}** × ${r[5]} (${r[6]})`);
-        const embed  = new EmbedBuilder()
-          .setTitle("📋 10 dernières opérations de stock")
+      const logs = await getLogs(10);
+      if (!logs.length) return interaction.editReply({ content: "📋 Aucun log trouvé." });
+      const lines = logs.map(r => {
+        const date = new Date(r.logged_at).toLocaleString("fr-FR");
+        const sign = r.delta > 0 ? "+" : "";
+        return `\`${date}\` — **${r.discord_user}** | ${sign}${r.delta} **${r.item}** (${r.location}) → ${r.new_qty}`;
+      });
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder()
+          .setTitle("📋 10 dernières opérations")
           .setDescription(lines.join("\n"))
-          .setColor(0x004080).setTimestamp().setFooter({ text: "CHL — Google Sheets Logs" });
-        return interaction.editReply({ embeds: [embed] });
-      } catch (err) {
-        return interaction.editReply({ content: `❌ ${err.message}` });
-      }
+          .setColor(0x004080).setTimestamp()
+          .setFooter({ text: "CHL — Supabase Logs" })
+      ]});
     }
 
-    // ── Système CHL — Select menu (création de ticket) ──
+    // ════════════════════════════════════════
+    //  TICKETS CHL — Select menu création
+    // ════════════════════════════════════════
     if (interaction.isStringSelectMenu() && interaction.customId === "ticket_create") {
       const type   = interaction.values[0];
       const member = interaction.member;
@@ -879,48 +786,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
 
       return withLock(`ticket_create:${member.user.id}:${type}`, async () => {
-        try {
-          const existing = await findChannelByName(guild, channelName, catId);
-          if (existing)
-            return interaction.editReply({ content: `❌ Vous avez déjà un ticket de ce type ouvert : <#${existing.id}>` });
+        const existing = await findChannelByName(guild, channelName, catId);
+        if (existing)
+          return interaction.editReply({ content: `❌ Vous avez déjà un ticket ouvert : <#${existing.id}>` });
 
-          const channel = await guild.channels.create({
-            name: channelName, type: ChannelType.GuildText,
-            parent: catId || undefined,
-            permissionOverwrites: buildTicketPermissions(guild, member.user.id),
-            topic: `Ticket ${label} — ${member.user.tag}`,
-          });
-          const embed = new EmbedBuilder()
+        const ch = await guild.channels.create({
+          name: channelName, type: ChannelType.GuildText,
+          parent: catId || undefined,
+          permissionOverwrites: buildTicketPermissions(guild, member.user.id),
+          topic: `Ticket ${label} — ${member.user.tag}`,
+        });
+        await ch.send({
+          content: `<@${member.user.id}> <@&${ROLE_TICKETS}>`,
+          embeds: [new EmbedBuilder()
             .setTitle(`🎫 ${label}`)
             .setDescription(`Bonjour <@${member.user.id}>, votre ticket a été créé.\n\nNotre équipe vous répondra dans les plus brefs délais.\n\n**Type :** ${label}\n**Créé par :** ${member.user.tag}`)
             .setColor(0x004080).setTimestamp()
-            .setFooter({ text: "CHL — Utilisez les boutons ci-dessous pour gérer ce ticket" });
-          await channel.send({ content: `<@${member.user.id}> <@&${ROLE_TICKETS}>`, embeds: [embed], components: [buildTicketButtons()] });
-          return interaction.editReply({ content: `✅ Votre ticket a été créé : <#${channel.id}>` });
-        } catch (err) {
-          console.error("ticket_create:", err);
-          return interaction.editReply({ content: `❌ Erreur : ${err.message}` });
-        }
+            .setFooter({ text: "CHL — Utilisez les boutons pour gérer ce ticket" })],
+          components: [buildTicketButtons()],
+        });
+        return interaction.editReply({ content: `✅ Ticket créé : <#${ch.id}>` });
       });
     }
 
+    // ── Ticket — Fermer ──
     if (interaction.isButton() && interaction.customId === "ticket_close") {
       if (!isStaff(interaction.member))
-        return interaction.reply({ content: "❌ Seul le staff peut fermer les tickets.", ephemeral: true });
+        return interaction.reply({ content: "❌ Staff uniquement.", ephemeral: true });
       await interaction.reply({ content: "🔒 Ticket fermé." });
-      const channel = interaction.channel;
-      for (const [id] of channel.permissionOverwrites.cache) {
+      const ch = interaction.channel;
+      for (const [id] of ch.permissionOverwrites.cache)
         if (!STAFF_ROLES.includes(id) && id !== guild.id)
-          await channel.permissionOverwrites.edit(id, { SendMessages: false }).catch(() => {});
-      }
-      await channel.setName("fermé-" + channel.name).catch(() => {});
+          await ch.permissionOverwrites.edit(id, { SendMessages: false }).catch(() => {});
+      await ch.setName("fermé-" + ch.name).catch(() => {});
       return;
     }
 
+    // ── Ticket — Supprimer ──
     if (interaction.isButton() && interaction.customId === "ticket_delete") {
       if (!isStaff(interaction.member))
-        return interaction.reply({ content: "❌ Seul le staff peut supprimer les tickets.", ephemeral: true });
-      await interaction.reply({ content: "🗑️ Suppression du ticket dans 5 secondes..." });
+        return interaction.reply({ content: "❌ Staff uniquement.", ephemeral: true });
+      await interaction.reply({ content: "🗑️ Suppression dans 5 secondes..." });
       setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
       return;
     }
@@ -935,14 +841,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch {}
   }
 });
-
-// Helper pour récupérer la quantité d'un item
-async function getItemQty(location, item) {
-  try {
-    const stock = await readStock(location === "Pharmacie" ? SHEET_PHARMA : SHEET_SOIN);
-    return stock[item] ?? 0;
-  } catch { return "?"; }
-}
 
 if (TOKEN) {
   client.login(TOKEN).catch(err => console.error("client.login:", err));
@@ -969,125 +867,102 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
-
 app.use(express.json());
 
-// Middleware JWT — vérifie le token pour les routes /admin/*
+// ── Middleware JWT ──
 function requireAdminToken(req, res, next) {
-  const authHeader = req.headers.authorization;
-  const token      = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : req.query.token;
+  const auth  = req.headers.authorization;
+  const token = auth?.startsWith("Bearer ") ? auth.slice(7) : req.query.token;
   if (!token) return res.status(401).json({ success: false, error: "Token manquant" });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     if (payload.role !== "logistique" && payload.role !== "admin")
       return res.status(403).json({ success: false, error: "Rôle insuffisant" });
-    req.jwtPayload = payload;
+    req.jwt = payload;
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ success: false, error: "Token invalide ou expiré" });
   }
 }
 
-app.get("/", (_, res) => res.json({ status: "CHL Bot API v3.2 ✅ — Préfixe : //" }));
+app.get("/", (_, res) => res.json({ status: "CHL Bot API v3.3 ✅" }));
 
-// ── Vérification du token JWT (page admin) ──
+// ── Admin : vérification token ──
 app.get("/api/admin/verify", requireAdminToken, (req, res) => {
-  res.json({ success: true, userId: req.jwtPayload.userId, guildId: req.jwtPayload.guildId });
+  res.json({ success: true, userId: req.jwt.userId, guildId: req.jwt.guildId });
 });
 
-// ── Stock — Lire ──
+// ── Admin : lire stock ──
 app.get("/api/admin/stock", requireAdminToken, async (req, res) => {
   const { location } = req.query;
-  if (!location) return res.json({ success: false, error: "Paramètre location manquant" });
-  const sheetName = location === "Pharmacie" ? SHEET_PHARMA : SHEET_SOIN;
-  try { res.json({ success: true, stock: await readStock(sheetName) }); }
+  if (!location) return res.json({ success: false, error: "location manquant" });
+  try { res.json({ success: true, stock: await readStock(location) }); }
   catch (err) { res.json({ success: false, error: err.message }); }
 });
 
-// ── Stock — Ajouter / modifier quantité ──
+// ── Admin : modifier quantité ──
 app.post("/api/admin/stock/update", requireAdminToken, async (req, res) => {
   const { location, item, delta } = req.body;
   if (!location || !item || delta === undefined)
     return res.json({ success: false, error: "Paramètres manquants" });
-  const sheetName = location === "Pharmacie" ? SHEET_PHARMA : SHEET_SOIN;
   try {
-    const { oldQty, newQty } = await updateStock(sheetName, item, delta);
-    await appendLog(`Admin [${req.jwtPayload.userId}]`, item, delta, location);
+    const { oldQty, newQty } = await updateStock(location, item, delta);
+    await appendLog(`Admin [${req.jwt.userId}]`, item, delta, location, newQty);
     // Log Discord
     try {
-      const logChannel = await client.channels.fetch(LOG_CHANNEL);
-      const embed = new EmbedBuilder()
-        .setTitle(`📦 Mise à jour Stock — ${delta > 0 ? "Ajout" : "Retrait"} (Admin)`)
+      const logCh = await client.channels.fetch(LOG_CHANNEL);
+      await logCh.send({ embeds: [new EmbedBuilder()
+        .setTitle(`📦 Mise à jour stock — ${delta > 0 ? "Ajout" : "Retrait"} (Admin)`)
         .addFields(
-          { name: "Produit",   value: item,                 inline: true },
-          { name: "Quantité",  value: `${Math.abs(delta)}`, inline: true },
-          { name: "Lieu",      value: location,             inline: true },
-          { name: "Avant",     value: `${oldQty}`,          inline: true },
-          { name: "Après",     value: `${newQty}`,          inline: true },
+          { name: "Produit",  value: item,                 inline: true },
+          { name: "Qté",      value: `${Math.abs(delta)}`, inline: true },
+          { name: "Lieu",     value: location,             inline: true },
+          { name: "Avant",    value: `${oldQty}`,          inline: true },
+          { name: "Après",    value: `${newQty}`,          inline: true },
         )
         .setColor(delta > 0 ? 0x27ae60 : 0xe74c3c).setTimestamp()
-        .setFooter({ text: `Par le panel admin — UID Discord : ${req.jwtPayload.userId}` });
-      await logChannel.send({ embeds: [embed] });
+        .setFooter({ text: `Panel admin — UID : ${req.jwt.userId}` })
+      ]});
     } catch (_) {}
     // Rafraîchir le panel Discord
     try {
-      const guild    = await client.guilds.fetch(req.jwtPayload.guildId);
-      const stockCh  = await findChannelByName(guild, STOCK_CHANNEL_NAME, STOCK_CATEGORY_ID);
-      if (stockCh) {
-        const messages = await stockCh.messages.fetch({ limit: 5 });
-        const panelMsg = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0);
-        if (panelMsg) await panelMsg.edit(await buildStockPanelMessage(guild, stockCh.id));
-      }
+      const guild = await client.guilds.fetch(req.jwt.guildId);
+      await refreshStockPanel(guild);
     } catch (_) {}
     res.json({ success: true, oldQty, newQty });
   } catch (err) { res.json({ success: false, error: err.message }); }
 });
 
-// ── Stock — Ajouter un nouvel article ──
+// ── Admin : ajouter un article ──
 app.post("/api/admin/stock/add-item", requireAdminToken, async (req, res) => {
   const { location, item } = req.body;
   if (!location || !item) return res.json({ success: false, error: "location et item requis" });
-  const sheetName = location === "Pharmacie" ? SHEET_PHARMA : SHEET_SOIN;
   try {
-    await addItemToSheet(sheetName, item.trim());
+    await addStockItem(location, item.trim());
     res.json({ success: true });
   } catch (err) { res.json({ success: false, error: err.message }); }
 });
 
-// ── Stock — Logs ──
+// ── Admin : logs ──
 app.get("/api/admin/stock/logs", requireAdminToken, async (req, res) => {
   try {
-    const sheets = await getSheetsClient();
-    const result = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${SHEET_LOGS}!A2:G` });
-    const data   = (result.data.values || []).map(r => ({
-      date: r[0]||"", heure: r[1]||"", user: r[2]||"",
-      item: r[3]||"", action: r[4]||"", quantite: parseInt(r[5])||0, lieu: r[6]||""
-    }));
-    res.json({ success: true, data });
+    const logs = await getLogs(100);
+    res.json({ success: true, data: logs });
   } catch (err) { res.json({ success: false, error: err.message }); }
 });
 
-// ── Routes publiques (existantes) ──
-app.get("/api/stock", async (req, res) => {
-  const lieu = req.query.lieu;
-  if (!lieu) return res.json({ success: false, error: "Paramètre lieu manquant" });
-  const sheetName = lieu === "Pharmacie" ? SHEET_PHARMA : SHEET_SOIN;
-  try { res.json({ success: true, stock: await readStock(sheetName) }); }
-  catch (err) { res.json({ success: false, error: err.message }); }
-});
-
-app.get("/api/logs", async (req, res) => {
+// ── Vérification Discord (site web) ──
+app.get("/api/check-discord", async (req, res) => {
+  const username = (req.query.username || "").trim();
+  if (!username) return res.json({ found: false });
   try {
-    const sheets = await getSheetsClient();
-    const result = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${SHEET_LOGS}!A2:G` });
-    const data   = (result.data.values || []).map(r => ({
-      date: r[0]||"", heure: r[1]||"", user: r[2]||"",
-      item: r[3]||"", action: r[4]||"", quantite: parseInt(r[5])||0, lieu: r[6]||""
-    }));
-    res.json({ success: true, data });
-  } catch (err) { res.json({ success: false, error: err.message }); }
+    const guild   = await client.guilds.fetch(GUILD_ID);
+    const members = await guild.members.search({ query: username, limit: 10 });
+    res.json({ found: members.some(m => m.user.username.toLowerCase() === username.toLowerCase()) });
+  } catch { res.json({ found: false }); }
 });
 
+// ── Envoi code de connexion ──
 app.get("/api/send_code", async (req, res) => {
   const username = req.query.user;
   if (!username) return res.json({ success: false, error: "Pseudo manquant" });
@@ -1097,11 +972,12 @@ app.get("/api/send_code", async (req, res) => {
     const member  = members.first();
     if (!member) return res.json({ success: false, error: "Utilisateur introuvable" });
     const code = createCode(username);
-    await member.send(`🔐 **Code de connexion CHL :** \`${code}\`\n⏱️ Valide 10 minutes.\n\nSi vous n'avez pas demandé ce code, ignorez ce message.`);
+    await member.send(`🔐 **Code de connexion CHL :** \`${code}\`\n⏱️ Valide 10 minutes.`);
     res.json({ success: true });
-  } catch (err) { res.json({ success: false, error: "Impossible d'envoyer le code DM" }); }
+  } catch { res.json({ success: false, error: "Impossible d'envoyer le DM" }); }
 });
 
+// ── Vérification code ──
 app.get("/api/verify", async (req, res) => {
   const { user, code } = req.query;
   if (!verifyCode(user, code)) return res.json({ success: false, error: "Code invalide ou expiré" });
@@ -1110,125 +986,161 @@ app.get("/api/verify", async (req, res) => {
     const members = await guild.members.search({ query: user, limit: 1 });
     const member  = members.first();
     const channel = await client.channels.fetch(LOG_CHANNEL);
-    const embed   = new EmbedBuilder().setTitle("🔓 Connexion au site").setDescription(`<@${member.id}> vient de se connecter.`).setColor("Blue").setTimestamp();
-    await channel.send({ content: `<@${member.id}>`, embeds: [embed] });
+    await channel.send({ content: `<@${member.id}>`, embeds: [
+      new EmbedBuilder().setTitle("🔓 Connexion au site").setDescription(`<@${member.id}> vient de se connecter.`).setColor("Blue").setTimestamp()
+    ]});
     res.json({ success: true });
-  } catch (err) { res.json({ success: false, error: "Erreur log connexion" }); }
+  } catch { res.json({ success: false, error: "Erreur log connexion" }); }
 });
 
-const recentLogStock = new Map();
-app.post("/api/log_stock", async (req, res) => {
-  const { user, item, delta, location } = req.body;
-  if (!user || !item || delta === undefined || !location)
-    return res.json({ success: false, error: "Paramètres manquants" });
-  const key = `${user}|${item}|${delta}|${location}`;
-  const now = Date.now();
-  const last = recentLogStock.get(key);
-  if (last && now - last < 3000) return res.json({ success: false, error: "Requête dupliquée ignorée (moins de 3s)" });
-  recentLogStock.set(key, now);
-  for (const [k, t] of recentLogStock) if (now - t > 60_000) recentLogStock.delete(k);
-  const sheetName = location === "Pharmacie" ? SHEET_PHARMA : SHEET_SOIN;
-  try {
-    const { oldQty, newQty } = await updateStock(sheetName, item, delta);
-    await appendLog(user, item, delta, location);
-    const guild   = await client.guilds.fetch(GUILD_ID);
-    const members = await guild.members.search({ query: user, limit: 1 });
-    const member  = members.first();
-    const channel = await client.channels.fetch(LOG_CHANNEL);
-    const action  = delta > 0 ? "Ajout" : "Retrait";
-    const embed   = new EmbedBuilder()
-      .setTitle(`📦 Log Stock — ${action}`)
-      .setDescription(`<@${member.id}> a modifié le stock.`)
-      .addFields(
-        { name: "Produit",  value: item,                 inline: true },
-        { name: "Quantité", value: `${Math.abs(delta)}`, inline: true },
-        { name: "Action",   value: action,               inline: true },
-        { name: "Lieu",     value: location,             inline: true },
-        { name: "Avant",    value: `${oldQty}`,          inline: true },
-        { name: "Après",    value: `${newQty}`,          inline: true }
-      )
-      .setColor(delta > 0 ? "Green" : "Red").setTimestamp();
-    await channel.send({ content: `<@${member.id}>`, embeds: [embed] });
-    res.json({ success: true, newQty });
-  } catch (err) { console.error("log_stock:", err.message); res.json({ success: false, error: err.message }); }
-});
-
-app.get("/api/check-discord", async (req, res) => {
-  const username = (req.query.username || "").trim();
-  if (!username) return res.json({ found: false });
-  try {
-    const guild   = await client.guilds.fetch(GUILD_ID);
-    const members = await guild.members.search({ query: username, limit: 10 });
-    res.json({ found: members.some(m => m.user.username.toLowerCase() === username.toLowerCase()) });
-  } catch (err) { res.json({ found: false }); }
-});
-
+// ── Candidature ──
 app.post("/api/candidature", async (req, res) => {
   const data = req.body;
-  if (!data || !data.discord) return res.json({ success: false, error: "Données manquantes ou pseudo Discord absent" });
-  const hopitalSuffix = (data.hopitalCible === "sud") ? "sud" : "nord";
-  const safeTag  = (data.discord || "inconnu").replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
-  const chanName = `rc-${safeTag}-${hopitalSuffix}`.substring(0, 100);
-  const catId    = TICKET_CATEGORIES.recrutement_form;
+  if (!data?.discord) return res.json({ success: false, error: "Pseudo Discord absent" });
+
+  const hopitalSuffix = data.hopitalCible === "sud" ? "sud" : "nord";
+  const safeTag       = data.discord.replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
+  const chanName      = `rc-${safeTag}-${hopitalSuffix}`.substring(0, 100);
+  const catId         = TICKET_CATEGORIES.recrutement_form;
+
   return withLock(`candidature:${safeTag}:${hopitalSuffix}`, async () => {
     try {
       const guild    = await client.guilds.fetch(GUILD_ID);
       const existing = await findChannelByName(guild, chanName, catId);
       if (existing) return res.json({ success: true, channel: existing.id, channelName: existing.name, duplicate: true });
+
       let memberId = null;
       try {
         const members = await guild.members.search({ query: data.discord.replace(/^\./, ""), limit: 5 });
-        const found   = members.find(m => m.user.username.toLowerCase() === data.discord.replace(/^\./, "").toLowerCase() || m.user.tag.toLowerCase() === data.discord.toLowerCase());
+        const found   = members.find(m =>
+          m.user.username.toLowerCase() === data.discord.replace(/^\./, "").toLowerCase() ||
+          m.user.tag.toLowerCase() === data.discord.toLowerCase()
+        );
         if (found) memberId = found.user.id;
-      } catch(_) {}
+      } catch (_) {}
+
       const perms = [{ id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }];
       if (memberId) perms.push({ id: memberId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
       for (const roleId of STAFF_ROLES) perms.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
-      const channel = await guild.channels.create({ name: chanName, type: ChannelType.GuildText, parent: catId || undefined, permissionOverwrites: perms, topic: `Candidature de ${data.discord} — Hôpital ${hopitalSuffix.toUpperCase()}` });
+
+      const channel      = await guild.channels.create({ name: chanName, type: ChannelType.GuildText, parent: catId || undefined, permissionOverwrites: perms, topic: `Candidature de ${data.discord} — Hôpital ${hopitalSuffix.toUpperCase()}` });
       const hopitalLabel = hopitalSuffix === "sud" ? "🏥 Hôpital Sud" : "🏥 Hôpital Nord";
+
       const fields = [
-        { name: "🎮 Discord", value: data.discord||"—", inline: true }, { name: "📱 Téléphone", value: data.telephone||"—", inline: true },
-        { name: "🏥 Hôpital visé", value: hopitalLabel, inline: true }, { name: "👤 Nom", value: data.nom||"—", inline: true },
-        { name: "👤 Prénom", value: data.prenom||"—", inline: true }, { name: "🎂 Âge", value: data.age||"—", inline: true },
-        { name: "⚖️ Casier jud.", value: data.casier||"—", inline: true },
+        { name: "🎮 Discord",       value: data.discord   || "—", inline: true },
+        { name: "📱 Téléphone",     value: data.telephone || "—", inline: true },
+        { name: "🏥 Hôpital visé", value: hopitalLabel,           inline: true },
+        { name: "👤 Nom",           value: data.nom       || "—", inline: true },
+        { name: "👤 Prénom",        value: data.prenom    || "—", inline: true },
+        { name: "🎂 Âge",           value: data.age       || "—", inline: true },
+        { name: "⚖️ Casier jud.",   value: data.casier    || "—", inline: true },
       ];
       if (data.experiencePasse === "oui") {
-        fields.push({ name: "💼 Ancien métier", value: data.ancienMetier||"—", inline: true }, { name: "🏅 Ancien grade", value: data.ancienGrade||"—", inline: true }, { name: "🔄 Raison du chgt", value: data.raisonChgt||"—", inline: false }, { name: "🤝 Inter-équipe", value: data.interEquipe||"—", inline: false });
+        fields.push(
+          { name: "💼 Ancien métier",  value: data.ancienMetier || "—", inline: true },
+          { name: "🏅 Ancien grade",   value: data.ancienGrade  || "—", inline: true },
+          { name: "🔄 Raison du chgt", value: data.raisonChgt   || "—", inline: false },
+          { name: "🤝 Inter-équipe",   value: data.interEquipe  || "—", inline: false },
+        );
       }
-      fields.push({ name: "🧠 Description perso.", value: data.description||"—", inline: false }, { name: "⚠️ Plus gros défaut", value: data.defaut||"—", inline: false }, { name: "🏥 Expérience médicale", value: data.expMedicale||"—", inline: true });
-      if (data.metierMedical) { fields.push({ name: "👨‍⚕️ Métier IRL", value: data.metierMedical, inline: true }); if (data.specialisation) fields.push({ name: "🔬 Spécialisation", value: data.specialisation, inline: true }); if (data.hopital) fields.push({ name: "🏢 Hôpital", value: data.hopital, inline: true }); if (data.expDetail) fields.push({ name: "📋 Détail expérience", value: data.expDetail, inline: false }); }
-      fields.push({ name: "💬 Motivation", value: data.motivation||"—", inline: false }, { name: "✨ Citation fav.", value: data.citation||"—", inline: true }, { name: "🏷️ Mot qui me représente", value: data.mot||"—", inline: true }, { name: "📚 Formation acceptée", value: data.formation||"—", inline: true });
-      const embed = new EmbedBuilder().setTitle(`📋 Candidature — ${data.discord} [${hopitalSuffix.toUpperCase()}]`).setDescription(`Nouvelle candidature reçue via le formulaire web.\n${memberId ? `\nMembre identifié : <@${memberId}>` : "\n⚠️ Membre Discord non trouvé sur le serveur"}`).addFields(fields).setColor(hopitalSuffix === "sud" ? 0x004080 : 0x005c2e).setTimestamp().setFooter({ text: `CHL Recrutement — ${hopitalLabel}` });
-      const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("ticket_close").setLabel("🔒 Fermer").setStyle(ButtonStyle.Secondary), new ButtonBuilder().setCustomId("ticket_delete").setLabel("🗑️ Supprimer").setStyle(ButtonStyle.Danger));
-      await channel.send({ content: `📬 Nouvelle candidature de ${memberId ? `<@${memberId}>` : `(${data.discord})`} <@&${ROLE_RECRUTEMENT}>`, embeds: [embed], components: [row] });
+      fields.push(
+        { name: "🧠 Description",        value: data.description || "—", inline: false },
+        { name: "⚠️ Plus gros défaut",   value: data.defaut      || "—", inline: false },
+        { name: "🏥 Expérience médicale",value: data.expMedicale || "—", inline: true  },
+      );
+      if (data.metierMedical) {
+        fields.push({ name: "👨‍⚕️ Métier IRL", value: data.metierMedical, inline: true });
+        if (data.specialisation) fields.push({ name: "🔬 Spécialisation",    value: data.specialisation, inline: true });
+        if (data.hopital)        fields.push({ name: "🏢 Hôpital",           value: data.hopital,        inline: true });
+        if (data.expDetail)      fields.push({ name: "📋 Détail expérience", value: data.expDetail,      inline: false });
+      }
+      fields.push(
+        { name: "💬 Motivation",            value: data.motivation || "—", inline: false },
+        { name: "✨ Citation fav.",         value: data.citation   || "—", inline: true  },
+        { name: "🏷️ Mot qui me représente", value: data.mot        || "—", inline: true  },
+        { name: "📚 Formation acceptée",    value: data.formation  || "—", inline: true  },
+      );
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("ticket_close").setLabel("🔒 Fermer").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("ticket_delete").setLabel("🗑️ Supprimer").setStyle(ButtonStyle.Danger),
+      );
+
+      await channel.send({
+        content: `📬 Nouvelle candidature de ${memberId ? `<@${memberId}>` : `(${data.discord})`} <@&${ROLE_RECRUTEMENT}>`,
+        embeds: [new EmbedBuilder()
+          .setTitle(`📋 Candidature — ${data.discord} [${hopitalSuffix.toUpperCase()}]`)
+          .setDescription(`Nouvelle candidature reçue via le formulaire web.\n${memberId ? `\nMembre : <@${memberId}>` : "\n⚠️ Membre non trouvé sur le serveur"}`)
+          .addFields(fields)
+          .setColor(hopitalSuffix === "sud" ? 0x004080 : 0x005c2e)
+          .setTimestamp().setFooter({ text: `CHL Recrutement — ${hopitalLabel}` })],
+        components: [row],
+      });
+
       res.json({ success: true, channel: channel.id, channelName: channel.name });
     } catch (err) { console.error("candidature:", err); res.json({ success: false, error: err.message }); }
   });
 });
 
+// ── Rendez-vous ──
 app.post("/api/rendezvous", async (req, res) => {
   const { discord, prenom, date, heure, motif, doctorName, doctorSpecialty, doctorDiscordId } = req.body;
   if (!discord || !prenom || !date || !heure || !motif || !doctorName || !doctorDiscordId)
     return res.json({ success: false, error: "Paramètres manquants" });
+
   const chanName = `rdv-${discord.replace(/[^a-zA-Z0-9_]/g,"").toLowerCase()}-${doctorName.replace(/[^a-zA-Z0-9_]/g,"").toLowerCase().substring(0,20)}`.substring(0, 100);
   const catId    = TICKET_CATEGORIES.rendezvous;
+
   return withLock(`rdv:${chanName}`, async () => {
     try {
-      const guild = await client.guilds.fetch(GUILD_ID);
+      const guild    = await client.guilds.fetch(GUILD_ID);
       const existing = await findChannelByName(guild, chanName, catId);
       if (existing) return res.json({ success: true, channel: existing.id, channelName: existing.name, duplicate: true });
+
       let patientId = null;
-      try { const members = await guild.members.search({ query: discord.replace(/^\./, ""), limit: 5 }); const found = members.find(m => m.user.username.toLowerCase() === discord.replace(/^\./, "").toLowerCase() || m.user.tag.toLowerCase() === discord.toLowerCase()); if (found) patientId = found.user.id; } catch(_) {}
+      try {
+        const members = await guild.members.search({ query: discord.replace(/^\./, ""), limit: 5 });
+        const found   = members.find(m => m.user.username.toLowerCase() === discord.replace(/^\./, "").toLowerCase() || m.user.tag.toLowerCase() === discord.toLowerCase());
+        if (found) patientId = found.user.id;
+      } catch (_) {}
+
       let doctorMember = null;
-      try { doctorMember = await guild.members.fetch(doctorDiscordId); } catch(_) {}
+      try { doctorMember = await guild.members.fetch(doctorDiscordId); } catch (_) {}
+
       const perms = [{ id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }];
       if (patientId)    perms.push({ id: patientId,       allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] });
       if (doctorMember) perms.push({ id: doctorDiscordId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels] });
       for (const roleId of STAFF_ROLES) perms.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
-      const channel = await guild.channels.create({ name: chanName, type: ChannelType.GuildText, parent: catId || undefined, permissionOverwrites: perms, topic: `Rendez-vous — ${discord} avec ${doctorName} le ${date} à ${heure}` });
-      const embed = new EmbedBuilder().setTitle("📅 Demande de Rendez-vous — CHL").setDescription(`Une demande de rendez-vous a été créée via le site web.\n\n${patientId ? `👤 **Patient :** <@${patientId}>` : `👤 **Patient :** ${discord} *(non trouvé)*`}\n${doctorMember ? `👨‍⚕️ **Médecin :** <@${doctorDiscordId}> — ${doctorName}` : `👨‍⚕️ **Médecin :** ${doctorName} *(non trouvé)*`}`).addFields({ name: "👤 Prénom", value: prenom, inline: true }, { name: "🎮 Discord", value: discord, inline: true }, { name: "👨‍⚕️ Médecin", value: doctorName, inline: true }, { name: "🔬 Spécialité", value: doctorSpecialty||"—", inline: true }, { name: "📅 Date souhaitée", value: date, inline: true }, { name: "🕐 Heure souhaitée", value: heure, inline: true }, { name: "💬 Motif", value: motif, inline: false }).setColor(0x004080).setTimestamp().setFooter({ text: "CHL — Rendez-vous via site web" });
-      const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("ticket_close").setLabel("🔒 Fermer").setStyle(ButtonStyle.Secondary), new ButtonBuilder().setCustomId("ticket_delete").setLabel("🗑️ Supprimer").setStyle(ButtonStyle.Danger));
-      await channel.send({ content: `📬 Nouveau rendez-vous — ${patientId ? `<@${patientId}>` : `(${discord})`} avec ${doctorMember ? `<@${doctorDiscordId}>` : `(${doctorName})`}`, embeds: [embed], components: [row] });
+
+      const channel = await guild.channels.create({ name: chanName, type: ChannelType.GuildText, parent: catId || undefined, permissionOverwrites: perms, topic: `RDV — ${discord} avec ${doctorName} le ${date} à ${heure}` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("ticket_close").setLabel("🔒 Fermer").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("ticket_delete").setLabel("🗑️ Supprimer").setStyle(ButtonStyle.Danger),
+      );
+
+      await channel.send({
+        content: `📬 Nouveau RDV — ${patientId ? `<@${patientId}>` : `(${discord})`} avec ${doctorMember ? `<@${doctorDiscordId}>` : `(${doctorName})`}`,
+        embeds: [new EmbedBuilder()
+          .setTitle("📅 Demande de Rendez-vous — CHL")
+          .setDescription(
+            `Demande créée via le site web.\n\n` +
+            `${patientId ? `👤 **Patient :** <@${patientId}>` : `👤 **Patient :** ${discord}`}\n` +
+            `${doctorMember ? `👨‍⚕️ **Médecin :** <@${doctorDiscordId}> — ${doctorName}` : `👨‍⚕️ **Médecin :** ${doctorName}`}`
+          )
+          .addFields(
+            { name: "👤 Prénom",          value: prenom,                inline: true },
+            { name: "🎮 Discord",         value: discord,               inline: true },
+            { name: "👨‍⚕️ Médecin",         value: doctorName,            inline: true },
+            { name: "🔬 Spécialité",      value: doctorSpecialty || "—", inline: true },
+            { name: "📅 Date souhaitée",  value: date,                  inline: true },
+            { name: "🕐 Heure souhaitée", value: heure,                 inline: true },
+            { name: "💬 Motif",           value: motif,                 inline: false },
+          )
+          .setColor(0x004080).setTimestamp().setFooter({ text: "CHL — Rendez-vous via site web" })],
+        components: [row],
+      });
+
       res.json({ success: true, channel: channel.id, channelName: channel.name });
     } catch (err) { console.error("rendezvous:", err); res.json({ success: false, error: err.message }); }
   });
