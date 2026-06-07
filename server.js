@@ -332,8 +332,7 @@ function buildSchedulePanel() {
     .setDescription(
       "Utilisez les boutons ci-dessous pour enregistrer vos informations de planning.\n\n" +
       "📋 **Absence** — Déclarez une période d'absence (date de départ, retour, raison)\n" +
-      "🕐 **Disponibilités** — Indiquez vos horaires semaine par semaine\n\n" +
-      `📊 **Voir le planning complet :** ${SCHEDULE_URL}`
+      "🕐 **Disponibilités** — Indiquez vos horaires semaine par semaine\n\n"
     )
     .setColor(0x004080)
     .setFooter({ text: "CHL — Les disponibilités sont valides 1 mois à partir de la date d'encodage" })
