@@ -1,5 +1,5 @@
 // stockApi.js — Module de communication avec l'API Supabase (CHL Bot v3.2)
-const STOCK_API_URL = process.env.STOCK_API_URL || "https://chl-bot-gestion-1.onrender.com";
+const STOCK_API_URL = process.env.STOCK_API_URL || "https://chl-bot-gestion22.onrender.com";
 
 async function registerStockChannel(channelId, guildId, channelName) {
   try {
